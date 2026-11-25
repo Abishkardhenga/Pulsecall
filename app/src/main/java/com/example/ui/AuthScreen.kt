@@ -247,6 +247,7 @@ fun AuthScreen(
                             scope = scope,
                             onAuthCancelled = {
                                 isLoading = false
+                                errorMessage = "Google Sign-In was cancelled. If no account picker appeared, ensure this APK's signing SHA-1 is registered in Firebase."
                             }
                         )
                     },
