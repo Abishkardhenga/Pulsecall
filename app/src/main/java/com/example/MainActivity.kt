@@ -4,6 +4,14 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -13,7 +21,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import androidx.credentials.CredentialManager
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -59,10 +71,15 @@ fun AppContent() {
     val credentialManager = remember(context) { CredentialManager.create(context) }
 
     var currentUser by remember { mutableStateOf(Firebase.auth.currentUser) }
+    var isCheckingSession by remember { mutableStateOf(Firebase.auth.currentUser == null) }
 
     DisposableEffect(Unit) {
         val listener = FirebaseAuth.AuthStateListener { auth ->
             currentUser = auth.currentUser
+            if (auth.currentUser != null) {
+                com.example.auth.AuthPersistence.markSignedIn(context, auth.currentUser)
+                isCheckingSession = false
+            }
         }
         Firebase.auth.addAuthStateListener(listener)
         onDispose { Firebase.auth.removeAuthStateListener(listener) }
@@ -73,28 +90,67 @@ fun AppContent() {
             attemptAutoSignIn(
                 context = context,
                 credentialManager = credentialManager,
-                onAuthSuccess = { currentUser = Firebase.auth.currentUser },
-                onUnauthenticated = {},
+                onAuthSuccess = {
+                    currentUser = Firebase.auth.currentUser
+                    isCheckingSession = false
+                },
+                onUnauthenticated = {
+                    isCheckingSession = false
+                },
                 scope = scope
             )
+        } else {
+            com.example.auth.AuthPersistence.markSignedIn(context, currentUser)
+            isCheckingSession = false
         }
     }
 
     val user = currentUser
-    if (user == null) {
-        AuthScreen(
-            onAuthSuccess = { currentUser = Firebase.auth.currentUser }
-        )
-    } else {
-        val uid = user.uid
-        val displayName = user.displayName?.takeIf { it.isNotBlank() } ?: "PulseCall User"
-        val photoUrl = user.photoUrl?.toString()
+    when {
+        user != null -> {
+            val uid = user.uid
+            val displayName = user.displayName?.takeIf { it.isNotBlank() } ?: "PulseCall User"
+            val photoUrl = user.photoUrl?.toString()
 
-        key(uid) {
-            AuthenticatedNavGraph(
-                currentUserId = uid,
-                userDisplayName = displayName,
-                userPhotoUrl = photoUrl
+            key(uid) {
+                AuthenticatedNavGraph(
+                    currentUserId = uid,
+                    userDisplayName = displayName,
+                    userPhotoUrl = photoUrl
+                )
+            }
+        }
+        isCheckingSession -> {
+            SessionRestoreScreen()
+        }
+        else -> {
+            AuthScreen(
+                onAuthSuccess = {
+                    currentUser = Firebase.auth.currentUser
+                    isCheckingSession = false
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun SessionRestoreScreen() {
+    androidx.compose.foundation.layout.Box(
+        modifier = androidx.compose.ui.Modifier
+            .fillMaxSize()
+            .background(androidx.compose.material3.MaterialTheme.colorScheme.background),
+        contentAlignment = androidx.compose.ui.Alignment.Center
+    ) {
+        androidx.compose.foundation.layout.Column(
+            horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp)
+        ) {
+            androidx.compose.material3.CircularProgressIndicator()
+            androidx.compose.material3.Text(
+                text = androidx.compose.ui.res.stringResource(R.string.restoring_session),
+                style = androidx.compose.material3.MaterialTheme.typography.bodyLarge,
+                color = androidx.compose.material3.MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }

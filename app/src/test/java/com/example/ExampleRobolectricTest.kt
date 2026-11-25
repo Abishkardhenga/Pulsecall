@@ -2,9 +2,12 @@ package com.example
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.example.auth.AuthPersistence
+import com.example.call.CallSoundEffects
 import com.example.data.CallRoom
 import com.example.data.DeviceSessionId
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -38,5 +41,25 @@ class ExampleRobolectricTest {
     assertEquals(0, room.answerEpoch)
     assertEquals(0, room.renegotiateEpoch)
     assertEquals("waiting", room.status)
+  }
+
+  @Test
+  fun `auth persistence remembers sign in until explicit clear`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    AuthPersistence.clear(context)
+    assertFalse(AuthPersistence.wasSignedIn(context))
+    AuthPersistence.markSignedIn(context, null)
+    assertTrue(AuthPersistence.wasSignedIn(context))
+    AuthPersistence.clear(context)
+    assertFalse(AuthPersistence.wasSignedIn(context))
+  }
+
+  @Test
+  fun `sound effects toggle updates state and releases cleanly`() {
+    val fx = CallSoundEffects()
+    assertTrue(fx.isSoundEnabled.value)
+    fx.toggleSoundEnabled()
+    assertFalse(fx.isSoundEnabled.value)
+    fx.release()
   }
 }

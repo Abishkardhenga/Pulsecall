@@ -56,6 +56,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.credentials.CredentialManager
 import com.example.R
+import com.example.auth.AuthPersistence
 import com.example.auth.onGoogleSignInClicked
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -66,6 +67,7 @@ fun AuthScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val credentialManager = remember(context) { CredentialManager.create(context) }
+    val rememberedEmail = remember(context) { AuthPersistence.lastEmail(context) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
@@ -212,6 +214,23 @@ fun AuthScreen(
                     .fillMaxWidth()
                     .padding(top = 28.dp, bottom = 12.dp)
             ) {
+                if (!rememberedEmail.isNullOrBlank()) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp)
+                    ) {
+                        Text(
+                            text = "Saved account: $rememberedEmail",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                        )
+                    }
+                }
+
                 if (errorMessage != null) {
                     Surface(
                         color = MaterialTheme.colorScheme.errorContainer,

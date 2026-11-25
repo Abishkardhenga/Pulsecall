@@ -7,6 +7,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.view.WindowManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -38,6 +39,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
@@ -46,6 +48,8 @@ import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.MicOff
+import androidx.compose.material.icons.rounded.NotificationsActive
+import androidx.compose.material.icons.rounded.NotificationsOff
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Videocam
@@ -116,17 +120,31 @@ fun CallScreen(
     val isFrontCamera by viewModel.isFrontCamera.collectAsStateWithLifecycle()
     val isSpeakerOn by viewModel.isSpeakerOn.collectAsStateWithLifecycle()
     val hasLocalCamera by viewModel.hasLocalCamera.collectAsStateWithLifecycle()
+    val isSoundEffectsEnabled by viewModel.isSoundEffectsEnabled.collectAsStateWithLifecycle()
+    val shouldExitCall by viewModel.shouldExitCall.collectAsStateWithLifecycle()
 
     var permissionsGranted by remember {
         mutableStateOf(hasCameraAndMicPermissions(context))
     }
     var permissionDeniedExplicitly by remember { mutableStateOf(false) }
 
+    val requiredPermissions = remember {
+        buildList {
+            add(Manifest.permission.CAMERA)
+            add(Manifest.permission.RECORD_AUDIO)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }.toTypedArray()
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        val cameraOk = results[Manifest.permission.CAMERA] == true
-        val audioOk = results[Manifest.permission.RECORD_AUDIO] == true
+        val cameraOk = results[Manifest.permission.CAMERA] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val audioOk = results[Manifest.permission.RECORD_AUDIO] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         if (cameraOk && audioOk) {
             permissionsGranted = true
             permissionDeniedExplicitly = false
@@ -142,9 +160,13 @@ fun CallScreen(
         if (permissionsGranted) {
             viewModel.onPermissionsGranted()
         } else {
-            permissionLauncher.launch(
-                arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-            )
+            permissionLauncher.launch(requiredPermissions)
+        }
+    }
+
+    LaunchedEffect(shouldExitCall) {
+        if (shouldExitCall) {
+            onExitCall()
         }
     }
 
@@ -184,9 +206,7 @@ fun CallScreen(
             PermissionGateOverlay(
                 denied = permissionDeniedExplicitly,
                 onRequestPermissions = {
-                    permissionLauncher.launch(
-                        arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
-                    )
+                    permissionLauncher.launch(requiredPermissions)
                 },
                 onBack = { viewModel.endCall(onExitCall) }
             )
@@ -260,14 +280,60 @@ fun CallScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Top
             ) {
-                CallStatusBadge(
-                    phase = callPhase,
-                    roomCode = viewModel.roomCode,
-                    peerName = peerName,
-                    peerPlatform = peerPlatform,
-                    elapsedSeconds = elapsedSeconds,
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.weight(1f, fill = false)
-                )
+                ) {
+                    CallStatusBadge(
+                        phase = callPhase,
+                        roomCode = viewModel.roomCode,
+                        peerName = peerName,
+                        peerPlatform = peerPlatform,
+                        elapsedSeconds = elapsedSeconds
+                    )
+
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.52f),
+                        shape = CircleShape,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .clip(CircleShape)
+                            .clickable(onClick = viewModel::toggleSoundEffects)
+                            .border(
+                                width = 1.dp,
+                                color = Color.White.copy(alpha = 0.14f),
+                                shape = CircleShape
+                            )
+                            .testTag("toggle_sound_fx_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isSoundEffectsEnabled)
+                                    Icons.Rounded.NotificationsActive
+                                else
+                                    Icons.Rounded.NotificationsOff,
+                                contentDescription = if (isSoundEffectsEnabled)
+                                    stringResource(R.string.sound_fx_on)
+                                else
+                                    stringResource(R.string.sound_fx_off),
+                                tint = if (isSoundEffectsEnabled) TealPulse else Color.White.copy(alpha = 0.6f),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = if (isSoundEffectsEnabled)
+                                    stringResource(R.string.sound_fx_on)
+                                else
+                                    stringResource(R.string.sound_fx_off),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.White.copy(alpha = 0.9f)
+                            )
+                        }
+                    }
+                }
 
                 Spacer(modifier = Modifier.width(12.dp))
 
@@ -321,7 +387,7 @@ private fun CallStatusBadge(
     val statusText = when (phase) {
         is CallPhase.RequestingPermissions -> "Permissions"
         is CallPhase.Initializing -> "Starting camera..."
-        is CallPhase.WaitingForPeer -> "Waiting · $roomCode"
+        is CallPhase.WaitingForPeer -> "Ringing · $roomCode"
         is CallPhase.Connecting -> "Connecting peer..."
         is CallPhase.Connected -> formatDuration(elapsedSeconds)
         is CallPhase.PeerEnded -> "Call ended"

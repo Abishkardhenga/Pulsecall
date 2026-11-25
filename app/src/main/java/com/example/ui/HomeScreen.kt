@@ -204,7 +204,7 @@ fun HomeScreen(
                         )
                     }
                     IconButton(
-                        onClick = { signOut(credentialManager, scope) },
+                        onClick = { signOut(context, credentialManager, scope) },
                         modifier = Modifier
                             .minimumInteractiveComponentSize()
                             .testTag("sign_out_button")

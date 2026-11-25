@@ -4,6 +4,9 @@ import android.content.Context
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.call.CallForegroundService
+import com.example.call.CallSessionBridge
+import com.example.call.CallSoundEffects
 import com.example.data.CallDirection
 import com.example.data.CallRecordStatus
 import com.example.data.CallRepository
@@ -52,7 +55,9 @@ class CallViewModel(
     private val isTakeover: Boolean = false
 ) : ViewModel() {
 
-    private val myDeviceId: String = DeviceSessionId.getOrCreate(appContext)
+    private val appCtx = appContext.applicationContext
+    private val myDeviceId: String = DeviceSessionId.getOrCreate(appCtx)
+    private val soundEffects = CallSoundEffects()
 
     private val _callPhase = MutableStateFlow<CallPhase>(CallPhase.RequestingPermissions)
     val callPhase: StateFlow<CallPhase> = _callPhase.asStateFlow()
@@ -66,6 +71,11 @@ class CallViewModel(
     private val _elapsedSeconds = MutableStateFlow(0L)
     val elapsedSeconds: StateFlow<Long> = _elapsedSeconds.asStateFlow()
 
+    private val _shouldExitCall = MutableStateFlow(false)
+    val shouldExitCall: StateFlow<Boolean> = _shouldExitCall.asStateFlow()
+
+    val isSoundEffectsEnabled: StateFlow<Boolean> = soundEffects.isSoundEnabled
+
     // Epoch & candidate tracking across WebRTC renegotiations
     private var activeOfferEpoch = 1
     private var lastAppliedAnswerEpoch = 0
@@ -73,6 +83,7 @@ class CallViewModel(
     private var lastHandledRenegotiateEpoch = 0
     private var pendingGuestOfferMinEpoch: Int? = null
     private var isRenegotiating = false
+    private var hasPlayedConnectedChimeForEpoch = -1
 
     @Volatile
     private var canSendIceCandidates = false
@@ -86,7 +97,7 @@ class CallViewModel(
     private var roomObserverJob: Job? = null
     private var timerJob: Job? = null
 
-    val webRtcManager: WebRtcManager = WebRtcManager(appContext) { candidate ->
+    val webRtcManager: WebRtcManager = WebRtcManager(appCtx) { candidate ->
         onGeneratedLocalIceCandidate(candidate)
     }
 
@@ -100,6 +111,12 @@ class CallViewModel(
     val hasLocalCamera: StateFlow<Boolean> = webRtcManager.hasLocalCamera
 
     init {
+        CallSessionBridge.registerHangUpHandler {
+            endCall {
+                _shouldExitCall.value = true
+            }
+        }
+
         viewModelScope.launch {
             webRtcManager.iceConnectionState.collectLatest { iceState ->
                 when (iceState) {
@@ -110,20 +127,44 @@ class CallViewModel(
                             phase !is CallPhase.SwitchedDevice &&
                             phase !is CallPhase.Error
                         ) {
+                            soundEffects.stopRingback()
+                            val currentEpoch = if (isHost) activeOfferEpoch else lastAppliedOfferEpoch
+                            if (hasPlayedConnectedChimeForEpoch != currentEpoch) {
+                                hasPlayedConnectedChimeForEpoch = currentEpoch
+                                soundEffects.playConnectedChime()
+                            }
                             _callPhase.value = CallPhase.Connected
                             startTimerIfNeeded()
+                            updateForegroundNotification()
                         }
                     }
                     PeerConnection.IceConnectionState.DISCONNECTED,
                     PeerConnection.IceConnectionState.FAILED -> {
                         if (_callPhase.value is CallPhase.Connected) {
                             _callPhase.value = CallPhase.Connecting
+                            updateForegroundNotification()
                         }
                     }
                     else -> Unit
                 }
             }
         }
+    }
+
+    private fun updateForegroundNotification() {
+        val statusText = when (_callPhase.value) {
+            is CallPhase.WaitingForPeer -> "Ringing · Waiting for peer to join"
+            is CallPhase.Connecting -> "Connecting audio & video…"
+            is CallPhase.Connected -> "Ongoing call · Audio active in background"
+            is CallPhase.Initializing -> "Starting call audio…"
+            else -> return
+        }
+        CallForegroundService.startOrUpdate(
+            context = appCtx,
+            roomCode = roomCode,
+            peerName = _peerName.value,
+            statusText = statusText
+        )
     }
 
     private fun onGeneratedLocalIceCandidate(candidate: IceCandidatePayload) {
@@ -168,6 +209,12 @@ class CallViewModel(
     fun onPermissionsGranted() {
         if (!hasStartedSession.compareAndSet(false, true)) return
         _callPhase.value = CallPhase.Initializing
+        CallForegroundService.startOrUpdate(
+            context = appCtx,
+            roomCode = roomCode,
+            peerName = _peerName.value,
+            statusText = "Starting call audio…"
+        )
         viewModelScope.launch {
             try {
                 webRtcManager.startLocalMedia()
@@ -180,6 +227,8 @@ class CallViewModel(
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start call session", e)
+                soundEffects.stopRingback()
+                CallForegroundService.stop(appCtx)
                 _callPhase.value = CallPhase.Error(e.localizedMessage ?: "Failed to start WebRTC call.")
             }
         }
@@ -207,9 +256,13 @@ class CallViewModel(
             onSuccess = {
                 enableAndFlushLocalIceCandidates()
                 _callPhase.value = CallPhase.WaitingForPeer
+                soundEffects.startRingback()
+                updateForegroundNotification()
                 observeRoomSignaling()
             },
             onFailure = { error ->
+                soundEffects.stopRingback()
+                CallForegroundService.stop(appCtx)
                 _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to create call room.")
             }
         )
@@ -218,18 +271,22 @@ class CallViewModel(
     private suspend fun startAsHostTakeover() {
         val roomResult = repository.getCallRoom(roomCode)
         val room = roomResult.getOrElse { error ->
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Failed to load call room.")
             return
         }
         if (room == null) {
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error("Room $roomCode was not found.")
             return
         }
         if (CallRoomStatus.fromWire(room.status) == CallRoomStatus.ENDED) {
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error("This call room has already ended.")
             return
         }
         if (room.hostUid != currentUserId) {
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error("Only the room host account can take over host control.")
             return
         }
@@ -258,14 +315,19 @@ class CallViewModel(
         handoffResult.fold(
             onSuccess = {
                 enableAndFlushLocalIceCandidates()
-                _callPhase.value = if (room.guestUid != null) {
-                    CallPhase.Connecting
+                soundEffects.playHandoffChime()
+                if (room.guestUid != null) {
+                    _callPhase.value = CallPhase.Connecting
                 } else {
-                    CallPhase.WaitingForPeer
+                    _callPhase.value = CallPhase.WaitingForPeer
+                    soundEffects.startRingback()
                 }
+                updateForegroundNotification()
                 observeRoomSignaling()
             },
             onFailure = { error ->
+                soundEffects.stopRingback()
+                CallForegroundService.stop(appCtx)
                 _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to switch host device.")
             }
         )
@@ -274,14 +336,17 @@ class CallViewModel(
     private suspend fun startAsGuest() {
         val roomResult = repository.getCallRoom(roomCode)
         val room = roomResult.getOrElse { error ->
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Failed to load call room.")
             return
         }
         if (room == null) {
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error("Room $roomCode was not found.")
             return
         }
         if (CallRoomStatus.fromWire(room.status) == CallRoomStatus.ENDED) {
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.Error("This call room has already ended.")
             return
         }
@@ -289,6 +354,7 @@ class CallViewModel(
         _peerName.value = room.hostName.ifBlank { "Remote Host" }
         _peerPlatform.value = room.hostPlatform.ifBlank { "unknown" }
         _callPhase.value = CallPhase.Connecting
+        updateForegroundNotification()
 
         val isTakingOverGuest = isTakeover || (room.guestUid == currentUserId)
         if (isTakingOverGuest && room.guestUid == currentUserId && room.guestDeviceId != myDeviceId) {
@@ -296,6 +362,7 @@ class CallViewModel(
             pauseAndClearIceState()
             pendingGuestOfferMinEpoch = room.offerEpoch
             lastAppliedOfferEpoch = room.offerEpoch
+            soundEffects.playHandoffChime()
             val reqResult = repository.requestGuestHandoff(
                 roomCode = roomCode,
                 guestDeviceId = myDeviceId,
@@ -307,6 +374,7 @@ class CallViewModel(
                     observeRoomSignaling()
                 },
                 onFailure = { error ->
+                    CallForegroundService.stop(appCtx)
                     _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to switch guest device.")
                 }
             )
@@ -315,6 +383,7 @@ class CallViewModel(
 
         // Standard first-time guest join
         pauseAndClearIceState()
+        soundEffects.playPeerJoiningChime()
         val offerEpoch = room.offerEpoch
         lastAppliedOfferEpoch = offerEpoch
         val answer = webRtcManager.createAnswer(room.offerSdp)
@@ -333,6 +402,7 @@ class CallViewModel(
                 observeRoomSignaling()
             },
             onFailure = { error ->
+                CallForegroundService.stop(appCtx)
                 _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to join call room.")
             }
         )
@@ -349,6 +419,8 @@ class CallViewModel(
                     if (firestoreError == null && error is CancellationException) throw error
                     val rootError = firestoreError ?: error
                     Log.w(TAG, "Room signaling error", rootError)
+                    soundEffects.stopRingback()
+                    CallForegroundService.stop(appCtx)
                     _callPhase.value = CallPhase.Error(rootError.localizedMessage ?: "Signaling connection lost.")
                 }
                 .collect { room ->
@@ -377,6 +449,8 @@ class CallViewModel(
 
         // 2. Check terminal room end
         if (status == CallRoomStatus.ENDED && _callPhase.value !is CallPhase.PeerEnded) {
+            soundEffects.playEndCallTone()
+            CallForegroundService.stop(appCtx)
             _callPhase.value = CallPhase.PeerEnded
             timerJob?.cancel()
             logHistoryOnce(statusOverride = CallRecordStatus.COMPLETED)
@@ -405,7 +479,10 @@ class CallViewModel(
             isRenegotiating = true
             try {
                 lastHandledRenegotiateEpoch = room.renegotiateEpoch
+                soundEffects.stopRingback()
+                soundEffects.playHandoffChime()
                 _callPhase.value = CallPhase.Connecting
+                updateForegroundNotification()
                 pauseAndClearIceState()
                 webRtcManager.resetPeerConnectionForHandoff()
 
@@ -440,7 +517,12 @@ class CallViewModel(
             room.answerEpoch > lastAppliedAnswerEpoch
         ) {
             lastAppliedAnswerEpoch = room.answerEpoch
+            soundEffects.stopRingback()
+            if (_callPhase.value is CallPhase.WaitingForPeer) {
+                soundEffects.playPeerJoiningChime()
+            }
             _callPhase.value = CallPhase.Connecting
+            updateForegroundNotification()
             try {
                 webRtcManager.setRemoteAnswer(room.answerSdp)
             } catch (e: Exception) {
@@ -477,7 +559,9 @@ class CallViewModel(
             try {
                 pendingGuestOfferMinEpoch = null
                 lastAppliedOfferEpoch = room.offerEpoch
+                soundEffects.playHandoffChime()
                 _callPhase.value = CallPhase.Connecting
+                updateForegroundNotification()
                 pauseAndClearIceState()
                 webRtcManager.resetPeerConnectionForHandoff()
 
@@ -514,6 +598,8 @@ class CallViewModel(
         timerJob?.cancel()
         roomObserverJob?.cancel()
         pauseAndClearIceState()
+        soundEffects.playHandoffChime()
+        CallForegroundService.stop(appCtx)
         logHistoryOnce(statusOverride = CallRecordStatus.COMPLETED)
         // Crucial: do NOT call endCallRoom() so the room stays live for the new device
         webRtcManager.release()
@@ -540,21 +626,43 @@ class CallViewModel(
         }
     }
 
-    fun toggleMic() = webRtcManager.toggleMic()
-    fun toggleCamera() = webRtcManager.toggleCamera()
-    fun switchCamera() = webRtcManager.switchCamera()
-    fun toggleSpeaker() = webRtcManager.toggleSpeaker()
+    fun toggleMic() {
+        webRtcManager.toggleMic()
+        soundEffects.playTogglePip(active = !webRtcManager.isMicMuted.value)
+    }
+
+    fun toggleCamera() {
+        webRtcManager.toggleCamera()
+        soundEffects.playTogglePip(active = webRtcManager.isCameraEnabled.value)
+    }
+
+    fun switchCamera() {
+        webRtcManager.switchCamera()
+        soundEffects.playTogglePip(active = true)
+    }
+
+    fun toggleSpeaker() {
+        webRtcManager.toggleSpeaker()
+        soundEffects.playTogglePip(active = webRtcManager.isSpeakerOn.value)
+    }
+
+    fun toggleSoundEffects() {
+        soundEffects.toggleSoundEnabled()
+    }
 
     fun endCall(onComplete: () -> Unit) {
         if (_callPhase.value is CallPhase.SwitchedDevice) {
             timerJob?.cancel()
             roomObserverJob?.cancel()
+            CallForegroundService.stop(appCtx)
             webRtcManager.release()
             onComplete()
             return
         }
         timerJob?.cancel()
         roomObserverJob?.cancel()
+        soundEffects.playEndCallTone()
+        CallForegroundService.stop(appCtx)
         val wasConnected = _elapsedSeconds.value > 0L || _callPhase.value is CallPhase.Connected
         val finalStatus = if (wasConnected) CallRecordStatus.COMPLETED else CallRecordStatus.CANCELLED
 
@@ -590,8 +698,11 @@ class CallViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        CallSessionBridge.clearHangUpHandler()
         timerJob?.cancel()
         roomObserverJob?.cancel()
+        soundEffects.release()
+        CallForegroundService.stop(appCtx)
         webRtcManager.release()
     }
 

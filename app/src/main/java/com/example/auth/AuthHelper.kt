@@ -23,6 +23,7 @@ import com.google.firebase.auth.auth
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
@@ -30,6 +31,39 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 
 private const val AUTH_TAG = "Auth"
+
+object AuthPersistence {
+    private const val PREFS_NAME = "pulsecall_auth_prefs"
+    private const val KEY_WAS_SIGNED_IN = "was_signed_in"
+    private const val KEY_LAST_EMAIL = "last_email"
+    private const val KEY_LAST_NAME = "last_name"
+
+    fun markSignedIn(context: Context, user: FirebaseUser?) {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putBoolean(KEY_WAS_SIGNED_IN, true)
+            .apply {
+                user?.email?.let { putString(KEY_LAST_EMAIL, it) }
+                user?.displayName?.let { putString(KEY_LAST_NAME, it) }
+            }
+            .apply()
+    }
+
+    fun wasSignedIn(context: Context): Boolean {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_WAS_SIGNED_IN, false)
+    }
+
+    fun lastEmail(context: Context): String? {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getString(KEY_LAST_EMAIL, null)
+    }
+
+    fun clear(context: Context) {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().clear().apply()
+    }
+}
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
@@ -52,38 +86,93 @@ fun attemptAutoSignIn(
     onUnauthenticated: () -> Unit,
     scope: CoroutineScope
 ) {
-    if (Firebase.auth.currentUser != null) {
+    val existingUser = Firebase.auth.currentUser
+    if (existingUser != null) {
+        AuthPersistence.markSignedIn(context, existingUser)
         onAuthSuccess()
         return
     }
-    val clientId = try {
-        context.getString(R.string.default_web_client_id)
-    } catch (_: Exception) {
-        onUnauthenticated()
-        return
-    }
-    val googleIdOption = GetGoogleIdOption.Builder()
-        .setFilterByAuthorizedAccounts(true)
-        .setServerClientId(clientId)
-        .setAutoSelectEnabled(true)
-        .build()
-    val request = GetCredentialRequest.Builder()
-        .addCredentialOption(googleIdOption)
-        .build()
+
     scope.launch {
-        try {
-            val credContext = context.findActivity() ?: context
-            val cred = credentialManager.getCredential(credContext, request).credential
-            if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
-                val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
-                Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+        // Give FirebaseAuth a brief window on cold boot to hydrate its persisted user from disk
+        repeat(4) {
+            val hydrated = Firebase.auth.currentUser
+            if (hydrated != null) {
+                AuthPersistence.markSignedIn(context, hydrated)
                 onAuthSuccess()
-            } else {
-                onUnauthenticated()
+                return@launch
             }
+            delay(80L)
+        }
+
+        val clientId = try {
+            context.getString(R.string.default_web_client_id)
         } catch (_: Exception) {
             onUnauthenticated()
+            return@launch
         }
+
+        val credContext = context.findActivity() ?: context
+
+        // Pass 1: Authorized accounts with auto-select
+        val authorizedSuccess = trySilentGoogleSignIn(
+            credContext = credContext,
+            credentialManager = credentialManager,
+            clientId = clientId,
+            filterByAuthorizedAccounts = true
+        )
+        if (authorizedSuccess) {
+            AuthPersistence.markSignedIn(context, Firebase.auth.currentUser)
+            onAuthSuccess()
+            return@launch
+        }
+
+        // Pass 2: If the user previously signed in (e.g. via GetSignInWithGoogleOption),
+        // retry without authorized-account filtering so saved account restores seamlessly
+        if (AuthPersistence.wasSignedIn(context)) {
+            val restoredSuccess = trySilentGoogleSignIn(
+                credContext = credContext,
+                credentialManager = credentialManager,
+                clientId = clientId,
+                filterByAuthorizedAccounts = false
+            )
+            if (restoredSuccess) {
+                AuthPersistence.markSignedIn(context, Firebase.auth.currentUser)
+                onAuthSuccess()
+                return@launch
+            }
+        }
+
+        onUnauthenticated()
+    }
+}
+
+private suspend fun trySilentGoogleSignIn(
+    credContext: Context,
+    credentialManager: CredentialManager,
+    clientId: String,
+    filterByAuthorizedAccounts: Boolean
+): Boolean {
+    return try {
+        val googleIdOption = GetGoogleIdOption.Builder()
+            .setFilterByAuthorizedAccounts(filterByAuthorizedAccounts)
+            .setServerClientId(clientId)
+            .setAutoSelectEnabled(true)
+            .build()
+        val request = GetCredentialRequest.Builder()
+            .addCredentialOption(googleIdOption)
+            .build()
+        val cred = credentialManager.getCredential(credContext, request).credential
+        if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
+            val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
+            Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+            Firebase.auth.currentUser != null
+        } else {
+            false
+        }
+    } catch (e: Exception) {
+        Log.d(AUTH_TAG, "Silent credential restore skipped (authorizedOnly=$filterByAuthorizedAccounts): ${e.message}")
+        false
     }
 }
 
@@ -116,6 +205,7 @@ fun onGoogleSignInClicked(
             if (cred is CustomCredential && cred.type == TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
                 val token = GoogleIdTokenCredential.createFrom(cred.data).idToken
                 Firebase.auth.signInWithCredential(GoogleAuthProvider.getCredential(token, null)).await()
+                AuthPersistence.markSignedIn(context, Firebase.auth.currentUser)
                 onAuthSuccess()
             } else {
                 onAuthError("Unexpected credential type returned.")
@@ -134,10 +224,12 @@ fun onGoogleSignInClicked(
 }
 
 fun signOut(
+    context: Context,
     credentialManager: CredentialManager,
     scope: CoroutineScope,
     onSignOutComplete: () -> Unit = {}
 ) {
+    AuthPersistence.clear(context)
     scope.launch {
         withContext(NonCancellable) {
             try {

@@ -17,4 +17,9 @@
     <string name="switch_to_this_device">Switch to This Device</string>
     <string name="switched_device_notice">Call moved to your other device.</string>
     <string name="dismiss_active_call">End Room</string>
+    <string name="call_notification_channel_name">Ongoing Video Calls</string>
+    <string name="call_notification_channel_desc">Keeps call audio active when PulseCall is in the background or screen is locked.</string>
+    <string name="restoring_session">Restoring your session…</string>
+    <string name="sound_fx_on">Call Sounds On</string>
+    <string name="sound_fx_off">Call Sounds Off</string>
 </resources>
