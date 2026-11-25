@@ -1,0 +1,6 @@
+{
+  "name": "PulseCall",
+  "description": "Cross-platform WebRTC video calling app for Android and iOS using real-time room signaling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,214 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- GLOBAL HARDENED PRIMITIVES ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // --- ENTITY VALIDATION BLUEPRINTS ---
+    function isValidUserProfile(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 60 &&
+             data.platform is string && data.platform in ['android', 'ios'] &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidCallHistoryEntry(data) {
+      return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
+             data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 16 &&
+             data.roomCode.matches('^[A-Z0-9\\-]+$') &&
+             data.peerName is string && data.peerName.size() >= 1 && data.peerName.size() <= 60 &&
+             data.peerPlatform is string && data.peerPlatform in ['android', 'ios', 'unknown'] &&
+             data.direction is string && data.direction in ['outgoing', 'incoming'] &&
+             data.status is string && data.status in ['completed', 'missed', 'cancelled'] &&
+             data.durationSeconds is int && data.durationSeconds >= 0 && data.durationSeconds <= 86400 &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidCandidateList(candidates) {
+      return candidates is list &&
+             candidates.size() <= 40 &&
+             (
+               candidates.size() == 0 ||
+               (
+                 candidates[0] is map &&
+                 candidates[0].keys().hasAll(['candidate', 'sdpMid', 'sdpMLineIndex']) &&
+                 candidates[0].keys().hasOnly(['candidate', 'sdpMid', 'sdpMLineIndex']) &&
+                 candidates[0].candidate is string && candidates[0].candidate.size() >= 1 && candidates[0].candidate.size() <= 1024 &&
+                 candidates[0].sdpMid is string && candidates[0].sdpMid.size() <= 64 &&
+                 candidates[0].sdpMLineIndex is int && candidates[0].sdpMLineIndex >= 0 && candidates[0].sdpMLineIndex <= 16
+               )
+             );
+    }
+
+    function isValidCallRoom(data) {
+      return data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128 &&
+             data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 60 &&
+             data.hostPlatform is string && data.hostPlatform in ['android', 'ios'] &&
+             data.status is string && data.status in ['waiting', 'connected', 'ended'] &&
+             data.offerSdp is string && data.offerSdp.size() >= 10 && data.offerSdp.size() <= 20000 &&
+             data.offerType is string && data.offerType == 'offer' &&
+             (!('guestUid' in data) || (data.guestUid is string && data.guestUid.size() >= 1 && data.guestUid.size() <= 128)) &&
+             (!('guestName' in data) || (data.guestName is string && data.guestName.size() >= 1 && data.guestName.size() <= 60)) &&
+             (!('guestPlatform' in data) || (data.guestPlatform is string && data.guestPlatform in ['android', 'ios'])) &&
+             (!('answerSdp' in data) || (data.answerSdp is string && data.answerSdp.size() >= 10 && data.answerSdp.size() <= 20000)) &&
+             (!('answerType' in data) || (data.answerType is string && data.answerType == 'answer')) &&
+             isValidCandidateList(data.callerCandidates) &&
+             isValidCandidateList(data.calleeCandidates) &&
+             data.createdAt is timestamp && data.createdAt <= request.time &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // --- COLLECTION RULES ---
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+
+      allow create: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       incoming().userId == request.auth.uid &&
+                       incoming().keys().hasAll(['userId', 'displayName', 'platform', 'createdAt', 'updatedAt']) &&
+                       incoming().keys().hasOnly(['userId', 'displayName', 'platform', 'createdAt', 'updatedAt']) &&
+                       isValidUserProfile(incoming());
+
+      allow update: if isOwner(userId) &&
+                       isValidId(userId) &&
+                       isValidUserProfile(incoming()) &&
+                       incoming().userId == existing().userId &&
+                       incoming().createdAt == existing().createdAt &&
+                       incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'platform', 'updatedAt']);
+
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      match /call_history/{entryId} {
+        allow get: if isOwner(userId) && isValidId(entryId);
+        allow list: if isOwner(userId);
+
+        allow create: if isOwner(userId) &&
+                         isValidId(entryId) &&
+                         incoming().userId == request.auth.uid &&
+                         incoming().keys().hasAll([
+                           'userId', 'roomCode', 'peerName', 'peerPlatform',
+                           'direction', 'status', 'durationSeconds', 'createdAt', 'updatedAt'
+                         ]) &&
+                         incoming().keys().hasOnly([
+                           'userId', 'roomCode', 'peerName', 'peerPlatform',
+                           'direction', 'status', 'durationSeconds', 'createdAt', 'updatedAt'
+                         ]) &&
+                         isValidCallHistoryEntry(incoming());
+
+        allow update: if isOwner(userId) &&
+                         isValidId(entryId) &&
+                         isValidCallHistoryEntry(incoming()) &&
+                         incoming().userId == existing().userId &&
+                         incoming().roomCode == existing().roomCode &&
+                         incoming().createdAt == existing().createdAt &&
+                         incoming().diff(existing()).affectedKeys().hasOnly([
+                           'peerName', 'peerPlatform', 'status', 'durationSeconds', 'updatedAt'
+                         ]);
+
+        allow delete: if isOwner(userId) && isValidId(entryId);
+      }
+    }
+
+    match /calls/{roomId} {
+      // Direct room lookup by exact room code for authenticated participants
+      allow get: if isSignedIn() && isValidId(roomId);
+      // List strictly scoped to rooms where the caller is host or guest
+      allow list: if isSignedIn() &&
+                     (resource.data.hostUid == request.auth.uid || resource.data.guestUid == request.auth.uid);
+
+      // Host creates a waiting signaling room with initial SDP offer
+      allow create: if isSignedIn() &&
+                       isValidId(roomId) &&
+                       incoming().hostUid == request.auth.uid &&
+                       incoming().status == 'waiting' &&
+                       incoming().keys().hasAll([
+                         'hostUid', 'hostName', 'hostPlatform', 'status',
+                         'offerSdp', 'offerType', 'callerCandidates', 'calleeCandidates',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'hostUid', 'hostName', 'hostPlatform', 'status',
+                         'offerSdp', 'offerType', 'callerCandidates', 'calleeCandidates',
+                         'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidCallRoom(incoming());
+
+      // Action-based updates with terminal state lock ('ended' is immutable)
+      allow update: if isSignedIn() &&
+                       isValidId(roomId) &&
+                       isValidCallRoom(incoming()) &&
+                       existing().status != 'ended' &&
+                       incoming().hostUid == existing().hostUid &&
+                       incoming().createdAt == existing().createdAt &&
+                       (
+                         // Action 1: Host appends ICE candidates
+                         (
+                           request.auth.uid == existing().hostUid &&
+                           incoming().callerCandidates.size() >= existing().callerCandidates.size() &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['callerCandidates', 'updatedAt'])
+                         ) ||
+                         // Action 2: Guest joins waiting room with SDP answer (+ optional initial ICE)
+                         (
+                           existing().status == 'waiting' &&
+                           !('guestUid' in existing()) &&
+                           incoming().guestUid == request.auth.uid &&
+                           incoming().status == 'connected' &&
+                           ('guestName' in incoming()) &&
+                           ('guestPlatform' in incoming()) &&
+                           ('answerSdp' in incoming()) &&
+                           ('answerType' in incoming()) &&
+                           incoming().diff(existing()).affectedKeys().hasOnly([
+                             'guestUid', 'guestName', 'guestPlatform',
+                             'answerSdp', 'answerType', 'calleeCandidates', 'status', 'updatedAt'
+                           ])
+                         ) ||
+                         // Action 3: Joined guest appends ICE candidates
+                         (
+                           ('guestUid' in existing()) &&
+                           request.auth.uid == existing().guestUid &&
+                           incoming().calleeCandidates.size() >= existing().calleeCandidates.size() &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['calleeCandidates', 'updatedAt'])
+                         ) ||
+                         // Action 4: Host or guest ends the call (terminal state)
+                         (
+                           (request.auth.uid == existing().hostUid || (('guestUid' in existing()) && request.auth.uid == existing().guestUid)) &&
+                           incoming().status == 'ended' &&
+                           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+                         )
+                       );
+
+      allow delete: if isSignedIn() &&
+                       isValidId(roomId) &&
+                       resource.data.hostUid == request.auth.uid;
+    }
+  }
+}

@@ -1,0 +1,192 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile storing display preferences and active platform.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Authenticated Firebase UID matching the document ID."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User display name shown in call UI."
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["android", "ios"],
+          "description": "Device platform identifier."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp (FieldValue.serverTimestamp()) when profile was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp (FieldValue.serverTimestamp()) when profile was updated."
+        }
+      },
+      "required": ["userId", "displayName", "platform", "createdAt", "updatedAt"]
+    },
+    "CallHistoryEntry": {
+      "title": "CallHistoryEntry",
+      "description": "Private user call history record with room code, peer details, and duration.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner Firebase UID."
+        },
+        "roomCode": {
+          "type": "string",
+          "description": "6-character alphanumeric call room code."
+        },
+        "peerName": {
+          "type": "string",
+          "description": "Display name of the remote participant."
+        },
+        "peerPlatform": {
+          "type": "string",
+          "enum": ["android", "ios", "unknown"],
+          "description": "Platform of the remote participant."
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["outgoing", "incoming"],
+          "description": "Whether the user hosted or joined the call."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["completed", "missed", "cancelled"],
+          "description": "Final outcome of the call session."
+        },
+        "durationSeconds": {
+          "type": "integer",
+          "description": "Total connected duration in seconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp (FieldValue.serverTimestamp()) when logged."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp (FieldValue.serverTimestamp()) when updated."
+        }
+      },
+      "required": [
+        "userId",
+        "roomCode",
+        "peerName",
+        "peerPlatform",
+        "direction",
+        "status",
+        "durationSeconds",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CallRoom": {
+      "title": "CallRoom",
+      "description": "Cross-platform WebRTC signaling room for SDP offer/answer and ICE candidate exchange between Android and iOS.",
+      "type": "object",
+      "properties": {
+        "hostUid": {
+          "type": "string",
+          "description": "Firebase UID of the room creator."
+        },
+        "hostName": {
+          "type": "string",
+          "description": "Display name of the host."
+        },
+        "hostPlatform": {
+          "type": "string",
+          "enum": ["android", "ios"],
+          "description": "Platform of the host device."
+        },
+        "guestUid": {
+          "type": "string",
+          "description": "Firebase UID of the joining participant."
+        },
+        "guestName": {
+          "type": "string",
+          "description": "Display name of the joining participant."
+        },
+        "guestPlatform": {
+          "type": "string",
+          "enum": ["android", "ios"],
+          "description": "Platform of the joining device."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["waiting", "connected", "ended"],
+          "description": "Lifecycle state of the signaling room."
+        },
+        "offerSdp": {
+          "type": "string",
+          "description": "WebRTC SDP offer string created by host."
+        },
+        "offerType": {
+          "type": "string",
+          "description": "SDP type for offer (offer)."
+        },
+        "answerSdp": {
+          "type": "string",
+          "description": "WebRTC SDP answer string created by guest."
+        },
+        "answerType": {
+          "type": "string",
+          "description": "SDP type for answer (answer)."
+        },
+        "callerCandidates": {
+          "type": "array",
+          "description": "Bounded list (max 40) of host ICE candidate maps."
+        },
+        "calleeCandidates": {
+          "type": "array",
+          "description": "Bounded list (max 40) of guest ICE candidate maps."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp (FieldValue.serverTimestamp()) when room was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp (FieldValue.serverTimestamp()) when room was last updated."
+        }
+      },
+      "required": [
+        "hostUid",
+        "hostName",
+        "hostPlatform",
+        "status",
+        "offerSdp",
+        "offerType",
+        "callerCandidates",
+        "calleeCandidates",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile document owned by userId."
+    },
+    "/users/{userId}/call_history/{entryId}": {
+      "schema": { "$ref": "#/entities/CallHistoryEntry" },
+      "description": "Private per-user call history records."
+    },
+    "/calls/{roomId}": {
+      "schema": { "$ref": "#/entities/CallRoom" },
+      "description": "Cross-platform WebRTC signaling room keyed by room code."
+    }
+  }
+}
