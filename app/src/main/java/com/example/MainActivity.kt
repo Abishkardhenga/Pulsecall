@@ -38,7 +38,7 @@ import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestore
 
 private const val ROUTE_HOME = "home"
-private const val ROUTE_CALL_PATTERN = "call/{roomCode}/{isHost}"
+private const val ROUTE_CALL_PATTERN = "call/{roomCode}/{isHost}/{takeover}"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -107,12 +107,13 @@ private fun AuthenticatedNavGraph(
     userPhotoUrl: String?
 ) {
     val navController = rememberNavController()
+    val context = LocalContext.current
 
     NavHost(
         navController = navController,
         startDestination = ROUTE_HOME
     ) {
-        composable(ROUTE_HOME) {
+        composable(ROUTE_HOME) { backStackEntry ->
             val homeViewModel: HomeViewModel = viewModel(
                 key = "home_$currentUserId",
                 factory = viewModelFactory {
@@ -123,23 +124,32 @@ private fun AuthenticatedNavGraph(
                         HomeViewModel(
                             repository = CallRepository(db),
                             currentUserId = currentUserId,
-                            userDisplayName = userDisplayName
+                            userDisplayName = userDisplayName,
+                            currentDeviceId = com.example.data.DeviceSessionId.getOrCreate(app)
                         )
                     }
                 }
             )
+
+            val handoffNotice = backStackEntry.savedStateHandle.get<String>("handoff_notice")
+            LaunchedEffect(handoffNotice) {
+                if (handoffNotice != null) {
+                    homeViewModel.showMessage(handoffNotice)
+                    backStackEntry.savedStateHandle.remove<String>("handoff_notice")
+                }
+            }
 
             HomeScreen(
                 viewModel = homeViewModel,
                 userDisplayName = userDisplayName,
                 userPhotoUrl = userPhotoUrl,
                 onStartCall = { roomCode ->
-                    navController.navigate("call/$roomCode/true") {
+                    navController.navigate("call/$roomCode/true/false") {
                         launchSingleTop = true
                     }
                 },
-                onJoinCall = { roomCode ->
-                    navController.navigate("call/$roomCode/false") {
+                onJoinCall = { roomCode, isHost, isTakeover ->
+                    navController.navigate("call/$roomCode/$isHost/$isTakeover") {
                         launchSingleTop = true
                     }
                 }
@@ -150,14 +160,16 @@ private fun AuthenticatedNavGraph(
             route = ROUTE_CALL_PATTERN,
             arguments = listOf(
                 navArgument("roomCode") { type = NavType.StringType },
-                navArgument("isHost") { type = NavType.BoolType }
+                navArgument("isHost") { type = NavType.BoolType },
+                navArgument("takeover") { type = NavType.BoolType }
             )
         ) { backStackEntry ->
             val roomCode = backStackEntry.arguments?.getString("roomCode").orEmpty()
             val isHost = backStackEntry.arguments?.getBoolean("isHost") ?: true
+            val isTakeover = backStackEntry.arguments?.getBoolean("takeover") ?: false
 
             val callViewModel: CallViewModel = viewModel(
-                key = "call_${currentUserId}_${roomCode}_$isHost",
+                key = "call_${currentUserId}_${roomCode}_${isHost}_$isTakeover",
                 factory = viewModelFactory {
                     initializer {
                         val app = checkNotNull(this[APPLICATION_KEY])
@@ -169,7 +181,8 @@ private fun AuthenticatedNavGraph(
                             currentUserId = currentUserId,
                             userDisplayName = userDisplayName,
                             roomCode = roomCode,
-                            isHost = isHost
+                            isHost = isHost,
+                            isTakeover = isTakeover
                         )
                     }
                 }
@@ -178,6 +191,13 @@ private fun AuthenticatedNavGraph(
             CallScreen(
                 viewModel = callViewModel,
                 onExitCall = {
+                    navController.popBackStack()
+                },
+                onSwitchedDevice = {
+                    navController.previousBackStackEntry?.savedStateHandle?.set(
+                        "handoff_notice",
+                        context.getString(R.string.switched_device_notice)
+                    )
                     navController.popBackStack()
                 }
             )

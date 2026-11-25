@@ -114,9 +114,9 @@ class CallRepository(
             val uid = requireUserId()
             val cleanRoomCode = roomCode.uppercase().filter { it.isLetterOrDigit() || it == '-' }.take(16)
             require(cleanRoomCode.length in 4..16) { "Invalid room code" }
-            val safePeerName = peerName.trim().ifBlank { "iOS / Remote Peer" }.take(60)
+            val safePeerName = peerName.trim().ifBlank { "Remote Peer" }.take(60)
             val safePlatform = when (peerPlatform.lowercase()) {
-                "android", "ios" -> peerPlatform.lowercase()
+                "android", "ios", "web" -> peerPlatform.lowercase()
                 else -> "unknown"
             }
             val safeDuration = durationSeconds.coerceIn(0L, 86400L)
@@ -163,6 +163,7 @@ class CallRepository(
 
     suspend fun createCallRoom(
         roomCode: String,
+        hostDeviceId: String,
         hostName: String,
         offerSdp: String
     ): Result<Unit> {
@@ -170,15 +171,20 @@ class CallRepository(
         return try {
             val uid = requireUserId()
             require(roomCode.matches(Regex("^[a-zA-Z0-9_\\-]{4,16}$"))) { "Invalid room code format" }
+            require(hostDeviceId.length in 4..64) { "Invalid device ID" }
             require(offerSdp.length in 10..20000) { "SDP offer size out of bounds" }
             val safeHostName = hostName.trim().ifBlank { "Android Host" }.take(60)
             val payload = mapOf(
                 "hostUid" to uid,
+                "hostDeviceId" to hostDeviceId,
                 "hostName" to safeHostName,
                 "hostPlatform" to "android",
                 "status" to CallRoomStatus.WAITING.wireValue,
                 "offerSdp" to offerSdp,
                 "offerType" to "offer",
+                "offerEpoch" to 1,
+                "answerEpoch" to 0,
+                "renegotiateEpoch" to 0,
                 "callerCandidates" to emptyList<Map<String, Any>>(),
                 "calleeCandidates" to emptyList<Map<String, Any>>(),
                 "createdAt" to FieldValue.serverTimestamp(),
@@ -219,21 +225,27 @@ class CallRepository(
 
     suspend fun joinCallRoom(
         roomCode: String,
+        guestDeviceId: String,
         guestName: String,
-        answerSdp: String
+        answerSdp: String,
+        offerEpoch: Int
     ): Result<Unit> {
         val path = "calls/$roomCode"
         return try {
             val uid = requireUserId()
+            require(guestDeviceId.length in 4..64) { "Invalid device ID" }
             require(answerSdp.length in 10..20000) { "SDP answer size out of bounds" }
             val safeGuestName = guestName.trim().ifBlank { "Android Guest" }.take(60)
             db.collection("calls").document(roomCode).update(
                 mapOf(
                     "guestUid" to uid,
+                    "guestDeviceId" to guestDeviceId,
                     "guestName" to safeGuestName,
                     "guestPlatform" to "android",
                     "answerSdp" to answerSdp,
                     "answerType" to "answer",
+                    "answerEpoch" to offerEpoch,
+                    "calleeCandidates" to emptyList<Map<String, Any>>(),
                     "status" to CallRoomStatus.CONNECTED.wireValue,
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
@@ -245,6 +257,90 @@ class CallRepository(
             handleFirestoreError(e, OperationType.UPDATE, path)
             Result.failure(e)
         }
+    }
+
+    suspend fun handoffHostToThisDevice(
+        roomCode: String,
+        hostDeviceId: String,
+        hostName: String,
+        offerSdp: String,
+        nextOfferEpoch: Int
+    ): Result<Unit> {
+        val path = "calls/$roomCode"
+        return try {
+            requireUserId()
+            require(hostDeviceId.length in 4..64) { "Invalid device ID" }
+            require(offerSdp.length in 10..20000) { "SDP offer size out of bounds" }
+            val safeHostName = hostName.trim().ifBlank { "Android Host" }.take(60)
+            db.collection("calls").document(roomCode).update(
+                mapOf(
+                    "hostDeviceId" to hostDeviceId,
+                    "hostName" to safeHostName,
+                    "hostPlatform" to "android",
+                    "offerSdp" to offerSdp,
+                    "offerType" to "offer",
+                    "offerEpoch" to nextOfferEpoch,
+                    "answerEpoch" to 0,
+                    "callerCandidates" to emptyList<Map<String, Any>>(),
+                    "calleeCandidates" to emptyList<Map<String, Any>>(),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun requestGuestHandoff(
+        roomCode: String,
+        guestDeviceId: String,
+        guestName: String,
+        nextRenegotiateEpoch: Int
+    ): Result<Unit> {
+        val path = "calls/$roomCode"
+        return try {
+            val uid = requireUserId()
+            require(guestDeviceId.length in 4..64) { "Invalid device ID" }
+            val safeGuestName = guestName.trim().ifBlank { "Android Guest" }.take(60)
+            db.collection("calls").document(roomCode).update(
+                mapOf(
+                    "guestUid" to uid,
+                    "guestDeviceId" to guestDeviceId,
+                    "guestName" to safeGuestName,
+                    "guestPlatform" to "android",
+                    "renegotiateEpoch" to nextRenegotiateEpoch,
+                    "answerEpoch" to 0,
+                    "calleeCandidates" to emptyList<Map<String, Any>>(),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun submitRenegotiatedAnswer(
+        roomCode: String,
+        guestDeviceId: String,
+        guestName: String,
+        answerSdp: String,
+        offerEpoch: Int
+    ): Result<Unit> {
+        return joinCallRoom(
+            roomCode = roomCode,
+            guestDeviceId = guestDeviceId,
+            guestName = guestName,
+            answerSdp = answerSdp,
+            offerEpoch = offerEpoch
+        )
     }
 
     suspend fun appendIceCandidate(
@@ -318,6 +414,44 @@ class CallRepository(
                     }
                     throw error
                 }
+        )
+    }
+
+    fun observeActiveCallsForUser(userId: String): Flow<List<CallRoom>> = flow {
+        val uid = auth.currentUser?.uid
+        if (uid.isNullOrBlank() || uid != userId) {
+            emit(emptyList())
+            return@flow
+        }
+        val hostFlow = db.collection("calls")
+            .whereEqualTo("hostUid", userId)
+            .snapshots()
+            .map { snapshot ->
+                snapshot.toObjects(CallRoom::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            }
+            .catch { error ->
+                if (error is CancellationException) throw error
+                emit(emptyList())
+            }
+
+        val guestFlow = db.collection("calls")
+            .whereEqualTo("guestUid", userId)
+            .snapshots()
+            .map { snapshot ->
+                snapshot.toObjects(CallRoom::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE)
+            }
+            .catch { error ->
+                if (error is CancellationException) throw error
+                emit(emptyList())
+            }
+
+        emitAll(
+            kotlinx.coroutines.flow.combine(hostFlow, guestFlow) { hostRooms, guestRooms ->
+                (hostRooms + guestRooms)
+                    .distinctBy { it.id }
+                    .filter { CallRoomStatus.fromWire(it.status) != CallRoomStatus.ENDED }
+                    .sortedByDescending { it.updatedAt?.toDate()?.time ?: 0L }
+            }
         )
     }
 }

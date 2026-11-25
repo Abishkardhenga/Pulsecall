@@ -54,11 +54,15 @@ test("Unauthenticated context: cannot read or write any collection", async () =>
   await assertFails(
     unauthDb.collection("calls").doc("ROOM12").set({
       hostUid: ALICE_UID,
+      hostDeviceId: "and-device-1",
       hostName: "Alice",
       hostPlatform: "android",
       status: "waiting",
       offerSdp: SAMPLE_OFFER_SDP,
       offerType: "offer",
+      offerEpoch: 1,
+      answerEpoch: 0,
+      renegotiateEpoch: 0,
       callerCandidates: [],
       calleeCandidates: [],
       createdAt: pastDate(),
@@ -160,21 +164,25 @@ test("CallHistory: owner CRUD & query alignment succeed; cross-user & @DocumentI
   );
 });
 
-test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, ICE updates, terminal lock, and intruder rejection", async () => {
+test("CallRoom signaling lifecycle: Android host + iOS/Web guest WebRTC handshake, same-UID device handoff, terminal lock, and intruder rejection", async () => {
   const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
   const bobDb = testEnv.authenticatedContext(BOB_UID).firestore();
   const charlieDb = testEnv.authenticatedContext(CHARLIE_UID).firestore();
   const created = pastDate(10000);
 
-  // 1. Alice (Android) creates signaling room
+  // 1. Alice (Android Phone) creates signaling room
   await assertSucceeds(
     aliceDb.collection("calls").doc("PULSE1").set({
       hostUid: ALICE_UID,
+      hostDeviceId: "and-alice-phone",
       hostName: "Alice Android",
       hostPlatform: "android",
       status: "waiting",
       offerSdp: SAMPLE_OFFER_SDP,
       offerType: "offer",
+      offerEpoch: 1,
+      answerEpoch: 0,
+      renegotiateEpoch: 0,
       callerCandidates: [],
       calleeCandidates: [],
       createdAt: created,
@@ -188,7 +196,7 @@ test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, I
       callerCandidates: [
         { candidate: "candidate:1 1 UDP 2122252543 192.168.1.10 54321 typ host", sdpMid: "0", sdpMLineIndex: 0 }
       ],
-      updatedAt: pastDate(4000),
+      updatedAt: pastDate(6000),
     })
   );
 
@@ -201,12 +209,14 @@ test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, I
   await assertSucceeds(
     bobDb.collection("calls").doc("PULSE1").update({
       guestUid: BOB_UID,
+      guestDeviceId: "ios-bob-iphone",
       guestName: "Bob iPhone",
       guestPlatform: "ios",
       answerSdp: SAMPLE_ANSWER_SDP,
       answerType: "answer",
+      answerEpoch: 1,
       status: "connected",
-      updatedAt: pastDate(3000),
+      updatedAt: pastDate(5000),
     })
   );
 
@@ -216,18 +226,91 @@ test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, I
       calleeCandidates: [
         { candidate: "candidate:2 1 UDP 2122252543 192.168.1.20 54322 typ host", sdpMid: "0", sdpMLineIndex: 0 }
       ],
+      updatedAt: pastDate(4500),
+    })
+  );
+
+  // 6. Alice switches from Android phone to Laptop Web with same UID (Action 4)
+  await assertSucceeds(
+    aliceDb.collection("calls").doc("PULSE1").update({
+      hostDeviceId: "web-alice-laptop",
+      hostName: "Alice Laptop",
+      hostPlatform: "web",
+      offerSdp: SAMPLE_OFFER_SDP,
+      offerType: "offer",
+      offerEpoch: 2,
+      answerEpoch: 0,
+      callerCandidates: [],
+      calleeCandidates: [],
+      updatedAt: pastDate(4000),
+    })
+  );
+
+  // 7. Bob sends fresh SDP answer for offerEpoch 2 (Action 5b)
+  await assertSucceeds(
+    bobDb.collection("calls").doc("PULSE1").update({
+      guestDeviceId: "ios-bob-iphone",
+      guestName: "Bob iPhone",
+      guestPlatform: "ios",
+      answerSdp: SAMPLE_ANSWER_SDP,
+      answerType: "answer",
+      answerEpoch: 2,
+      calleeCandidates: [],
+      status: "connected",
+      updatedAt: pastDate(3500),
+    })
+  );
+
+  // 8. Bob switches from iPhone to Laptop Web with same UID (Action 5a -> Host Action 4 -> Guest Action 5b)
+  await assertSucceeds(
+    bobDb.collection("calls").doc("PULSE1").update({
+      guestDeviceId: "web-bob-laptop",
+      guestName: "Bob Laptop",
+      guestPlatform: "web",
+      renegotiateEpoch: 1,
+      answerEpoch: 0,
+      calleeCandidates: [],
+      updatedAt: pastDate(3000),
+    })
+  );
+  await assertSucceeds(
+    aliceDb.collection("calls").doc("PULSE1").update({
+      hostDeviceId: "web-alice-laptop",
+      hostName: "Alice Laptop",
+      hostPlatform: "web",
+      offerSdp: SAMPLE_OFFER_SDP,
+      offerType: "offer",
+      offerEpoch: 3,
+      answerEpoch: 0,
+      callerCandidates: [],
+      calleeCandidates: [],
+      updatedAt: pastDate(2500),
+    })
+  );
+  await assertSucceeds(
+    bobDb.collection("calls").doc("PULSE1").update({
+      guestDeviceId: "web-bob-laptop",
+      guestName: "Bob Laptop",
+      guestPlatform: "web",
+      answerSdp: SAMPLE_ANSWER_SDP,
+      answerType: "answer",
+      answerEpoch: 3,
+      calleeCandidates: [],
+      status: "connected",
       updatedAt: pastDate(2000),
     })
   );
 
-  // 6. Intruder Charlie cannot hijack connected room or spoof Bob's candidates
+  // 9. Intruder Charlie cannot hijack connected room or spoof Bob's handoff
   await assertFails(
     charlieDb.collection("calls").doc("PULSE1").update({
       guestUid: CHARLIE_UID,
+      guestDeviceId: "and-charlie",
       guestName: "Charlie",
       guestPlatform: "android",
       answerSdp: SAMPLE_ANSWER_SDP,
       answerType: "answer",
+      answerEpoch: 3,
       status: "connected",
       updatedAt: pastDate(1500),
     })
@@ -239,15 +322,16 @@ test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, I
     })
   );
 
-  // 7. Bob cannot overwrite Alice's offerSdp or hostUid
+  // 10. Bob cannot overwrite Alice's offerSdp or hostUid
   await assertFails(
     bobDb.collection("calls").doc("PULSE1").update({
       offerSdp: "tampered_sdp_payload",
+      offerEpoch: 4,
       updatedAt: pastDate(1200),
     })
   );
 
-  // 8. Participant ends the call -> terminal state locked
+  // 11. Participant ends the call -> terminal state locked
   await assertSucceeds(
     aliceDb.collection("calls").doc("PULSE1").update({
       status: "ended",
@@ -255,7 +339,7 @@ test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, I
     })
   );
 
-  // 9. Subsequent updates after terminal state 'ended' are rejected
+  // 12. Subsequent updates after terminal state 'ended' are rejected
   await assertFails(
     bobDb.collection("calls").doc("PULSE1").update({
       status: "connected",
@@ -269,15 +353,19 @@ test("CallRoom signaling lifecycle: Android host + iOS guest WebRTC handshake, I
     })
   );
 
-  // 10. Tampered future timestamp rejected
+  // 13. Tampered future timestamp rejected
   await assertFails(
     aliceDb.collection("calls").doc("FUTURE1").set({
       hostUid: ALICE_UID,
+      hostDeviceId: "and-alice-phone",
       hostName: "Alice",
       hostPlatform: "android",
       status: "waiting",
       offerSdp: SAMPLE_OFFER_SDP,
       offerType: "offer",
+      offerEpoch: 1,
+      answerEpoch: 0,
+      renegotiateEpoch: 0,
       callerCandidates: [],
       calleeCandidates: [],
       createdAt: new Date(Date.now() + 60000),

@@ -91,6 +91,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.R
 import com.example.auth.signOut
+import com.example.data.ActiveCallSummary
 import com.example.data.CallDirection
 import com.example.data.CallHistoryEntry
 import com.example.data.UiState
@@ -105,7 +106,7 @@ fun HomeScreen(
     userDisplayName: String,
     userPhotoUrl: String?,
     onStartCall: (roomCode: String) -> Unit,
-    onJoinCall: (roomCode: String) -> Unit
+    onJoinCall: (roomCode: String, isHost: Boolean, isTakeover: Boolean) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -113,6 +114,7 @@ fun HomeScreen(
     val credentialManager = remember(context) { CredentialManager.create(context) }
 
     val callHistoryState by viewModel.callHistoryState.collectAsStateWithLifecycle()
+    val activeCall by viewModel.activeCallBanner.collectAsStateWithLifecycle()
     val joinCode by viewModel.joinRoomCode.collectAsStateWithLifecycle()
     val isValidatingJoin by viewModel.isValidatingJoin.collectAsStateWithLifecycle()
     val statusBanner by viewModel.statusBanner.collectAsStateWithLifecycle()
@@ -236,6 +238,17 @@ fun HomeScreen(
                             .verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(20.dp)
                     ) {
+                        activeCall?.let { active ->
+                            ActiveCallHandoffCard(
+                                activeCall = active,
+                                onSwitchHere = {
+                                    onJoinCall(active.roomCode, active.isHost, true)
+                                },
+                                onEndRoom = {
+                                    viewModel.endActiveRoom(active.roomCode)
+                                }
+                            )
+                        }
                         CallStudioCards(
                             joinCode = joinCode,
                             isValidatingJoin = isValidatingJoin,
@@ -273,6 +286,20 @@ fun HomeScreen(
                     contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(16.dp)
                 ) {
+                    activeCall?.let { active ->
+                        item(key = "active_handoff_${active.roomCode}") {
+                            ActiveCallHandoffCard(
+                                activeCall = active,
+                                onSwitchHere = {
+                                    onJoinCall(active.roomCode, active.isHost, true)
+                                },
+                                onEndRoom = {
+                                    viewModel.endActiveRoom(active.roomCode)
+                                }
+                            )
+                        }
+                    }
+
                     item {
                         CallStudioCards(
                             joinCode = joinCode,
@@ -382,6 +409,119 @@ fun HomeScreen(
                 onStartCall(quickCode)
             }
         )
+    }
+}
+
+@Composable
+private fun ActiveCallHandoffCard(
+    activeCall: ActiveCallSummary,
+    onSwitchHere: () -> Unit,
+    onEndRoom: () -> Unit
+) {
+    val platformLabel = when (activeCall.activeDevicePlatform.lowercase()) {
+        "web" -> "Web Laptop"
+        "ios" -> "iPhone / iPad"
+        "android" -> "Another Android"
+        else -> "Another Device"
+    }
+
+    Card(
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(
+                width = 1.5.dp,
+                color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.55f),
+                shape = RoundedCornerShape(24.dp)
+            )
+            .testTag("active_call_handoff_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Devices,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.secondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = stringResource(R.string.active_call_banner_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                }
+                Surface(
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.8f),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text(
+                        text = activeCall.roomCode,
+                        fontFamily = com.example.ui.theme.JetBrainsMonoFamily,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            Text(
+                text = "Currently active on $platformLabel · Peer: ${activeCall.peerName}. Switching transfers audio & video here and automatically cuts the other device.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.88f)
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                OutlinedButton(
+                    onClick = onEndRoom,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("end_active_room_button")
+                ) {
+                    Text(stringResource(R.string.dismiss_active_call))
+                }
+                Button(
+                    onClick = onSwitchHere,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary,
+                        contentColor = MaterialTheme.colorScheme.onSecondary
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("switch_device_call_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Videocam,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.switch_to_this_device),
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -702,6 +842,7 @@ private fun CallHistoryRow(
     val platformBadge = when (entry.peerPlatform.lowercase()) {
         "ios" -> "iOS"
         "android" -> "Android"
+        "web" -> "Web"
         else -> "WebRTC"
     }
     val formattedTime = remember(entry.createdAt) {

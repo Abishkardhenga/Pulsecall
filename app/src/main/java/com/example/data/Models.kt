@@ -97,20 +97,33 @@ data class IceCandidatePayload(
 data class CallRoom(
     @DocumentId val id: String = "",
     val hostUid: String = "",
+    val hostDeviceId: String = "",
     val hostName: String = "",
     val hostPlatform: String = "android",
     val guestUid: String? = null,
+    val guestDeviceId: String? = null,
     val guestName: String? = null,
     val guestPlatform: String? = null,
     val status: String = "waiting",
     val offerSdp: String = "",
     val offerType: String = "offer",
+    val offerEpoch: Int = 1,
     val answerSdp: String? = null,
     val answerType: String? = null,
+    val answerEpoch: Int = 0,
+    val renegotiateEpoch: Int = 0,
     val callerCandidates: List<Map<String, Any>> = emptyList(),
     val calleeCandidates: List<Map<String, Any>> = emptyList(),
     @ServerTimestamp val createdAt: Timestamp? = null,
     @ServerTimestamp val updatedAt: Timestamp? = null
+)
+
+data class ActiveCallSummary(
+    val roomCode: String,
+    val isHost: Boolean,
+    val activeDevicePlatform: String,
+    val peerName: String,
+    val status: CallRoomStatus
 )
 
 sealed interface UiState<out T> {
@@ -118,3 +131,4 @@ sealed interface UiState<out T> {
     data class Success<T>(val data: T) : UiState<T>
     data class Error(val message: String) : UiState<Nothing>
 }
+

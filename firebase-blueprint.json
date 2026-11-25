@@ -15,7 +15,7 @@
         },
         "platform": {
           "type": "string",
-          "enum": ["android", "ios"],
+          "enum": ["android", "ios", "web"],
           "description": "Device platform identifier."
         },
         "createdAt": {
@@ -50,7 +50,7 @@
         },
         "peerPlatform": {
           "type": "string",
-          "enum": ["android", "ios", "unknown"],
+          "enum": ["android", "ios", "web", "unknown"],
           "description": "Platform of the remote participant."
         },
         "direction": {
@@ -92,12 +92,16 @@
     },
     "CallRoom": {
       "title": "CallRoom",
-      "description": "Cross-platform WebRTC signaling room for SDP offer/answer and ICE candidate exchange between Android and iOS.",
+      "description": "Cross-platform WebRTC signaling room for SDP offer/answer, ICE candidate exchange, and single-active-device handoff across Android, iOS, and Web.",
       "type": "object",
       "properties": {
         "hostUid": {
           "type": "string",
           "description": "Firebase UID of the room creator."
+        },
+        "hostDeviceId": {
+          "type": "string",
+          "description": "Unique device identifier currently active for the host account."
         },
         "hostName": {
           "type": "string",
@@ -105,12 +109,16 @@
         },
         "hostPlatform": {
           "type": "string",
-          "enum": ["android", "ios"],
+          "enum": ["android", "ios", "web"],
           "description": "Platform of the host device."
         },
         "guestUid": {
           "type": "string",
           "description": "Firebase UID of the joining participant."
+        },
+        "guestDeviceId": {
+          "type": "string",
+          "description": "Unique device identifier currently active for the guest account."
         },
         "guestName": {
           "type": "string",
@@ -118,7 +126,7 @@
         },
         "guestPlatform": {
           "type": "string",
-          "enum": ["android", "ios"],
+          "enum": ["android", "ios", "web"],
           "description": "Platform of the joining device."
         },
         "status": {
@@ -133,6 +141,18 @@
         "offerType": {
           "type": "string",
           "description": "SDP type for offer (offer)."
+        },
+        "offerEpoch": {
+          "type": "integer",
+          "description": "Monotonic offer generation counter incremented on host handoff or renegotiation."
+        },
+        "answerEpoch": {
+          "type": "integer",
+          "description": "Matches offerEpoch once the guest submits a valid SDP answer for that offer, or 0 while awaiting a fresh answer."
+        },
+        "renegotiateEpoch": {
+          "type": "integer",
+          "description": "Monotonic counter incremented when guest switches devices to request a fresh offer."
         },
         "answerSdp": {
           "type": "string",
@@ -163,11 +183,15 @@
       },
       "required": [
         "hostUid",
+        "hostDeviceId",
         "hostName",
         "hostPlatform",
         "status",
         "offerSdp",
         "offerType",
+        "offerEpoch",
+        "answerEpoch",
+        "renegotiateEpoch",
         "callerCandidates",
         "calleeCandidates",
         "createdAt",

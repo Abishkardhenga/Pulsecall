@@ -33,7 +33,7 @@ service cloud.firestore {
     function isValidUserProfile(data) {
       return data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 128 &&
              data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 60 &&
-             data.platform is string && data.platform in ['android', 'ios'] &&
+             data.platform is string && data.platform in ['android', 'ios', 'web'] &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
     }
@@ -43,7 +43,7 @@ service cloud.firestore {
              data.roomCode is string && data.roomCode.size() >= 4 && data.roomCode.size() <= 16 &&
              data.roomCode.matches('^[A-Z0-9\\-]+$') &&
              data.peerName is string && data.peerName.size() >= 1 && data.peerName.size() <= 60 &&
-             data.peerPlatform is string && data.peerPlatform in ['android', 'ios', 'unknown'] &&
+             data.peerPlatform is string && data.peerPlatform in ['android', 'ios', 'web', 'unknown'] &&
              data.direction is string && data.direction in ['outgoing', 'incoming'] &&
              data.status is string && data.status in ['completed', 'missed', 'cancelled'] &&
              data.durationSeconds is int && data.durationSeconds >= 0 && data.durationSeconds <= 86400 &&
@@ -67,22 +67,40 @@ service cloud.firestore {
              );
     }
 
-    function isValidCallRoom(data) {
+    function isValidCallRoomCore(data) {
       return data.hostUid is string && data.hostUid.size() >= 1 && data.hostUid.size() <= 128 &&
+             data.hostDeviceId is string && data.hostDeviceId.size() >= 4 && data.hostDeviceId.size() <= 64 &&
              data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 60 &&
-             data.hostPlatform is string && data.hostPlatform in ['android', 'ios'] &&
-             data.status is string && data.status in ['waiting', 'connected', 'ended'] &&
+             data.hostPlatform in ['android', 'ios', 'web'] &&
+             data.status in ['waiting', 'connected', 'ended'] &&
              data.offerSdp is string && data.offerSdp.size() >= 10 && data.offerSdp.size() <= 20000 &&
-             data.offerType is string && data.offerType == 'offer' &&
-             (!('guestUid' in data) || (data.guestUid is string && data.guestUid.size() >= 1 && data.guestUid.size() <= 128)) &&
-             (!('guestName' in data) || (data.guestName is string && data.guestName.size() >= 1 && data.guestName.size() <= 60)) &&
-             (!('guestPlatform' in data) || (data.guestPlatform is string && data.guestPlatform in ['android', 'ios'])) &&
-             (!('answerSdp' in data) || (data.answerSdp is string && data.answerSdp.size() >= 10 && data.answerSdp.size() <= 20000)) &&
-             (!('answerType' in data) || (data.answerType is string && data.answerType == 'answer')) &&
-             isValidCandidateList(data.callerCandidates) &&
-             isValidCandidateList(data.calleeCandidates) &&
+             data.offerType == 'offer' &&
+             data.offerEpoch is int && data.offerEpoch >= 1 && data.offerEpoch <= 1000 &&
+             data.answerEpoch is int && data.answerEpoch >= 0 && data.answerEpoch <= 1000 &&
+             data.renegotiateEpoch is int && data.renegotiateEpoch >= 0 && data.renegotiateEpoch <= 1000 &&
              data.createdAt is timestamp && data.createdAt <= request.time &&
              data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidGuestFields(data) {
+      return data.guestUid is string && data.guestUid.size() >= 1 && data.guestUid.size() <= 128 &&
+             data.guestDeviceId is string && data.guestDeviceId.size() >= 4 && data.guestDeviceId.size() <= 64 &&
+             data.guestName is string && data.guestName.size() >= 1 && data.guestName.size() <= 60 &&
+             data.guestPlatform in ['android', 'ios', 'web'];
+    }
+
+    function isValidHostOfferFields(data) {
+      return data.hostDeviceId is string && data.hostDeviceId.size() >= 4 && data.hostDeviceId.size() <= 64 &&
+             data.hostName is string && data.hostName.size() >= 1 && data.hostName.size() <= 60 &&
+             data.hostPlatform in ['android', 'ios', 'web'] &&
+             data.offerSdp is string && data.offerSdp.size() >= 10 && data.offerSdp.size() <= 20000 &&
+             data.offerType == 'offer' &&
+             data.offerEpoch is int && data.offerEpoch <= 1000;
+    }
+
+    function isValidAnswerFields(data) {
+      return data.answerSdp is string && data.answerSdp.size() >= 10 && data.answerSdp.size() <= 20000 &&
+             data.answerType == 'answer';
     }
 
     // --- COLLECTION RULES ---
@@ -138,6 +156,84 @@ service cloud.firestore {
       }
     }
 
+    function canUpdateCallRoom(roomId) {
+      let inc = request.resource.data;
+      let ex = resource.data;
+      let changed = inc.diff(ex).affectedKeys();
+      let isHost = request.auth.uid == ex.hostUid;
+      let isExistingGuest = ('guestUid' in ex) && request.auth.uid == ex.guestUid;
+      return isSignedIn() &&
+             isValidId(roomId) &&
+             ex.status != 'ended' &&
+             inc.hostUid == ex.hostUid &&
+             inc.createdAt == ex.createdAt &&
+             inc.updatedAt is timestamp &&
+             inc.updatedAt <= request.time &&
+             (
+               // Terminal end by current host or guest
+               (
+                 (isHost || isExistingGuest) &&
+                 inc.status == 'ended' &&
+                 changed.hasOnly(['status', 'updatedAt'])
+               ) ||
+               // Host appends ICE candidates
+               (
+                 isHost &&
+                 changed.hasOnly(['callerCandidates', 'updatedAt']) &&
+                 isValidCandidateList(inc.callerCandidates) &&
+                 inc.callerCandidates.size() >= ex.callerCandidates.size()
+               ) ||
+               // Joined guest appends ICE candidates
+               (
+                 isExistingGuest &&
+                 changed.hasOnly(['calleeCandidates', 'updatedAt']) &&
+                 isValidCandidateList(inc.calleeCandidates) &&
+                 inc.calleeCandidates.size() >= ex.calleeCandidates.size()
+               ) ||
+               // Host switches device or issues fresh offer for guest handoff
+               (
+                 isHost &&
+                 inc.offerEpoch == ex.offerEpoch + 1 &&
+                 inc.answerEpoch == 0 &&
+                 inc.callerCandidates.size() == 0 &&
+                 inc.calleeCandidates.size() == 0 &&
+                 isValidHostOfferFields(inc) &&
+                 changed.hasOnly([
+                   'hostDeviceId', 'hostName', 'hostPlatform',
+                   'offerSdp', 'offerType', 'offerEpoch', 'answerEpoch',
+                   'callerCandidates', 'calleeCandidates', 'updatedAt'
+                 ])
+               ) ||
+               // Guest joins, switches device, or answers renegotiated host offer
+               (
+                 inc.guestUid == request.auth.uid &&
+                 inc.calleeCandidates.size() == 0 &&
+                 isValidGuestFields(inc) &&
+                 changed.hasOnly([
+                   'guestUid', 'guestDeviceId', 'guestName', 'guestPlatform',
+                   'answerSdp', 'answerType', 'answerEpoch', 'renegotiateEpoch',
+                   'calleeCandidates', 'status', 'updatedAt'
+                 ]) &&
+                 (
+                   (
+                     ((!('guestUid' in ex) && ex.status == 'waiting') || isExistingGuest) &&
+                     inc.status == 'connected' &&
+                     inc.answerEpoch == ex.offerEpoch &&
+                     inc.renegotiateEpoch == ex.renegotiateEpoch &&
+                     isValidAnswerFields(inc)
+                   ) ||
+                   (
+                     isExistingGuest &&
+                     inc.status == ex.status &&
+                     inc.renegotiateEpoch == ex.renegotiateEpoch + 1 &&
+                     inc.renegotiateEpoch <= 1000 &&
+                     inc.answerEpoch == 0
+                   )
+                 )
+               )
+             );
+    }
+
     match /calls/{roomId} {
       // Direct room lookup by exact room code for authenticated participants
       allow get: if isSignedIn() && isValidId(roomId);
@@ -150,61 +246,24 @@ service cloud.firestore {
                        isValidId(roomId) &&
                        incoming().hostUid == request.auth.uid &&
                        incoming().status == 'waiting' &&
+                       incoming().offerEpoch == 1 &&
+                       incoming().answerEpoch == 0 &&
+                       incoming().renegotiateEpoch == 0 &&
                        incoming().keys().hasAll([
-                         'hostUid', 'hostName', 'hostPlatform', 'status',
-                         'offerSdp', 'offerType', 'callerCandidates', 'calleeCandidates',
-                         'createdAt', 'updatedAt'
+                         'hostUid', 'hostDeviceId', 'hostName', 'hostPlatform', 'status',
+                         'offerSdp', 'offerType', 'offerEpoch', 'answerEpoch', 'renegotiateEpoch',
+                         'callerCandidates', 'calleeCandidates', 'createdAt', 'updatedAt'
                        ]) &&
                        incoming().keys().hasOnly([
-                         'hostUid', 'hostName', 'hostPlatform', 'status',
-                         'offerSdp', 'offerType', 'callerCandidates', 'calleeCandidates',
-                         'createdAt', 'updatedAt'
+                         'hostUid', 'hostDeviceId', 'hostName', 'hostPlatform', 'status',
+                         'offerSdp', 'offerType', 'offerEpoch', 'answerEpoch', 'renegotiateEpoch',
+                         'callerCandidates', 'calleeCandidates', 'createdAt', 'updatedAt'
                        ]) &&
-                       isValidCallRoom(incoming());
+                       isValidCallRoomCore(incoming()) &&
+                       isValidCandidateList(incoming().callerCandidates) &&
+                       isValidCandidateList(incoming().calleeCandidates);
 
-      // Action-based updates with terminal state lock ('ended' is immutable)
-      allow update: if isSignedIn() &&
-                       isValidId(roomId) &&
-                       isValidCallRoom(incoming()) &&
-                       existing().status != 'ended' &&
-                       incoming().hostUid == existing().hostUid &&
-                       incoming().createdAt == existing().createdAt &&
-                       (
-                         // Action 1: Host appends ICE candidates
-                         (
-                           request.auth.uid == existing().hostUid &&
-                           incoming().callerCandidates.size() >= existing().callerCandidates.size() &&
-                           incoming().diff(existing()).affectedKeys().hasOnly(['callerCandidates', 'updatedAt'])
-                         ) ||
-                         // Action 2: Guest joins waiting room with SDP answer (+ optional initial ICE)
-                         (
-                           existing().status == 'waiting' &&
-                           !('guestUid' in existing()) &&
-                           incoming().guestUid == request.auth.uid &&
-                           incoming().status == 'connected' &&
-                           ('guestName' in incoming()) &&
-                           ('guestPlatform' in incoming()) &&
-                           ('answerSdp' in incoming()) &&
-                           ('answerType' in incoming()) &&
-                           incoming().diff(existing()).affectedKeys().hasOnly([
-                             'guestUid', 'guestName', 'guestPlatform',
-                             'answerSdp', 'answerType', 'calleeCandidates', 'status', 'updatedAt'
-                           ])
-                         ) ||
-                         // Action 3: Joined guest appends ICE candidates
-                         (
-                           ('guestUid' in existing()) &&
-                           request.auth.uid == existing().guestUid &&
-                           incoming().calleeCandidates.size() >= existing().calleeCandidates.size() &&
-                           incoming().diff(existing()).affectedKeys().hasOnly(['calleeCandidates', 'updatedAt'])
-                         ) ||
-                         // Action 4: Host or guest ends the call (terminal state)
-                         (
-                           (request.auth.uid == existing().hostUid || (('guestUid' in existing()) && request.auth.uid == existing().guestUid)) &&
-                           incoming().status == 'ended' &&
-                           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
-                         )
-                       );
+      allow update: if canUpdateCallRoom(roomId);
 
       allow delete: if isSignedIn() &&
                        isValidId(roomId) &&

@@ -267,6 +267,24 @@ class WebRtcManager(
         setRemoteDescription(pc, answerDesc)
     }
 
+    fun resetPeerConnectionForHandoff() {
+        if (isReleased.get()) return
+        synchronized(pendingRemoteIceCandidates) {
+            pendingRemoteIceCandidates.clear()
+        }
+        isRemoteDescriptionSet = false
+        _remoteVideoTrack.value = null
+        _iceConnectionState.value = PeerConnection.IceConnectionState.NEW
+        try {
+            peerConnection?.close()
+            peerConnection?.dispose()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing old PeerConnection during handoff", e)
+        }
+        peerConnection = null
+        ensurePeerConnection()
+    }
+
     fun addRemoteIceCandidate(payload: IceCandidatePayload) {
         if (isReleased.get()) return
         val candidate = IceCandidate(payload.sdpMid, payload.sdpMLineIndex, payload.candidate)

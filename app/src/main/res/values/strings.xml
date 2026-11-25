@@ -11,6 +11,10 @@
     <string name="share_invite">Share Room Code</string>
     <string name="end_call">End Call</string>
     <string name="permissions_required_title">Camera &amp; Microphone Needed</string>
-    <string name="permissions_required_body">PulseCall needs camera and microphone access to stream encrypted WebRTC video and audio to your iOS or Android peer.</string>
+    <string name="permissions_required_body">PulseCall needs camera and microphone access to stream encrypted WebRTC video and audio to your Web, iOS, or Android peer.</string>
     <string name="grant_permissions">Allow Camera &amp; Mic</string>
+    <string name="active_call_banner_title">Active call on another device</string>
+    <string name="switch_to_this_device">Switch to This Device</string>
+    <string name="switched_device_notice">Call moved to your other device.</string>
+    <string name="dismiss_active_call">End Room</string>
 </resources>

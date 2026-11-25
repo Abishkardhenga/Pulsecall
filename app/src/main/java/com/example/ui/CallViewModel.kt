@@ -9,6 +9,7 @@ import com.example.data.CallRecordStatus
 import com.example.data.CallRepository
 import com.example.data.CallRoom
 import com.example.data.CallRoomStatus
+import com.example.data.DeviceSessionId
 import com.example.data.IceCandidatePayload
 import com.example.webrtc.WebRtcManager
 import com.google.firebase.firestore.FirebaseFirestoreException
@@ -37,6 +38,7 @@ sealed interface CallPhase {
     data object Connecting : CallPhase
     data object Connected : CallPhase
     data object PeerEnded : CallPhase
+    data object SwitchedDevice : CallPhase
     data class Error(val message: String) : CallPhase
 }
 
@@ -46,8 +48,11 @@ class CallViewModel(
     private val currentUserId: String,
     private val userDisplayName: String,
     val roomCode: String,
-    val isHost: Boolean
+    val isHost: Boolean,
+    private val isTakeover: Boolean = false
 ) : ViewModel() {
+
+    private val myDeviceId: String = DeviceSessionId.getOrCreate(appContext)
 
     private val _callPhase = MutableStateFlow<CallPhase>(CallPhase.RequestingPermissions)
     val callPhase: StateFlow<CallPhase> = _callPhase.asStateFlow()
@@ -61,9 +66,20 @@ class CallViewModel(
     private val _elapsedSeconds = MutableStateFlow(0L)
     val elapsedSeconds: StateFlow<Long> = _elapsedSeconds.asStateFlow()
 
-    private val sentCandidatesCount = AtomicBoolean(false)
+    // Epoch & candidate tracking across WebRTC renegotiations
+    private var activeOfferEpoch = 1
+    private var lastAppliedAnswerEpoch = 0
+    private var lastAppliedOfferEpoch = 0
+    private var lastHandledRenegotiateEpoch = 0
+    private var pendingGuestOfferMinEpoch: Int? = null
+    private var isRenegotiating = false
+
+    @Volatile
+    private var canSendIceCandidates = false
+    private val pendingLocalIceCandidates = mutableListOf<IceCandidatePayload>()
     private var localCandidatesSent = 0
     private val processedRemoteCandidateKeys = mutableSetOf<String>()
+
     private val hasStartedSession = AtomicBoolean(false)
     private val hasEndedOrLogged = AtomicBoolean(false)
 
@@ -71,12 +87,7 @@ class CallViewModel(
     private var timerJob: Job? = null
 
     val webRtcManager: WebRtcManager = WebRtcManager(appContext) { candidate ->
-        if (localCandidatesSent < MAX_ICE_CANDIDATES) {
-            localCandidatesSent++
-            viewModelScope.launch {
-                repository.appendIceCandidate(roomCode, isHost, candidate)
-            }
-        }
+        onGeneratedLocalIceCandidate(candidate)
     }
 
     val eglBase: EglBase get() = webRtcManager.eglBase
@@ -94,7 +105,11 @@ class CallViewModel(
                 when (iceState) {
                     PeerConnection.IceConnectionState.CONNECTED,
                     PeerConnection.IceConnectionState.COMPLETED -> {
-                        if (_callPhase.value !is CallPhase.PeerEnded && _callPhase.value !is CallPhase.Error) {
+                        val phase = _callPhase.value
+                        if (phase !is CallPhase.PeerEnded &&
+                            phase !is CallPhase.SwitchedDevice &&
+                            phase !is CallPhase.Error
+                        ) {
                             _callPhase.value = CallPhase.Connected
                             startTimerIfNeeded()
                         }
@@ -111,6 +126,45 @@ class CallViewModel(
         }
     }
 
+    private fun onGeneratedLocalIceCandidate(candidate: IceCandidatePayload) {
+        if (!canSendIceCandidates) {
+            synchronized(pendingLocalIceCandidates) {
+                if (pendingLocalIceCandidates.size < MAX_ICE_CANDIDATES) {
+                    pendingLocalIceCandidates.add(candidate)
+                }
+            }
+            return
+        }
+        sendIceCandidateIfUnderLimit(candidate)
+    }
+
+    private fun enableAndFlushLocalIceCandidates() {
+        val buffered: List<IceCandidatePayload>
+        synchronized(pendingLocalIceCandidates) {
+            buffered = pendingLocalIceCandidates.toList()
+            pendingLocalIceCandidates.clear()
+            canSendIceCandidates = true
+        }
+        buffered.forEach { sendIceCandidateIfUnderLimit(it) }
+    }
+
+    private fun pauseAndClearIceState() {
+        canSendIceCandidates = false
+        synchronized(pendingLocalIceCandidates) {
+            pendingLocalIceCandidates.clear()
+        }
+        localCandidatesSent = 0
+        processedRemoteCandidateKeys.clear()
+    }
+
+    private fun sendIceCandidateIfUnderLimit(candidate: IceCandidatePayload) {
+        if (localCandidatesSent >= MAX_ICE_CANDIDATES) return
+        localCandidatesSent++
+        viewModelScope.launch {
+            repository.appendIceCandidate(roomCode, isHost, candidate)
+        }
+    }
+
     fun onPermissionsGranted() {
         if (!hasStartedSession.compareAndSet(false, true)) return
         _callPhase.value = CallPhase.Initializing
@@ -118,7 +172,7 @@ class CallViewModel(
             try {
                 webRtcManager.startLocalMedia()
                 if (isHost) {
-                    startAsHost()
+                    if (isTakeover) startAsHostTakeover() else startAsHost()
                 } else {
                     startAsGuest()
                 }
@@ -138,19 +192,81 @@ class CallViewModel(
     }
 
     private suspend fun startAsHost() {
+        pauseAndClearIceState()
         val offer = webRtcManager.createOffer()
+        activeOfferEpoch = 1
+        lastAppliedAnswerEpoch = 0
+        lastHandledRenegotiateEpoch = 0
         val createResult = repository.createCallRoom(
             roomCode = roomCode,
+            hostDeviceId = myDeviceId,
             hostName = userDisplayName,
             offerSdp = offer.description
         )
         createResult.fold(
             onSuccess = {
+                enableAndFlushLocalIceCandidates()
                 _callPhase.value = CallPhase.WaitingForPeer
                 observeRoomSignaling()
             },
             onFailure = { error ->
                 _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to create call room.")
+            }
+        )
+    }
+
+    private suspend fun startAsHostTakeover() {
+        val roomResult = repository.getCallRoom(roomCode)
+        val room = roomResult.getOrElse { error ->
+            _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Failed to load call room.")
+            return
+        }
+        if (room == null) {
+            _callPhase.value = CallPhase.Error("Room $roomCode was not found.")
+            return
+        }
+        if (CallRoomStatus.fromWire(room.status) == CallRoomStatus.ENDED) {
+            _callPhase.value = CallPhase.Error("This call room has already ended.")
+            return
+        }
+        if (room.hostUid != currentUserId) {
+            _callPhase.value = CallPhase.Error("Only the room host account can take over host control.")
+            return
+        }
+
+        if (!room.guestName.isNullOrBlank()) {
+            _peerName.value = room.guestName
+        }
+        if (!room.guestPlatform.isNullOrBlank()) {
+            _peerPlatform.value = room.guestPlatform
+        }
+
+        pauseAndClearIceState()
+        val nextOfferEpoch = room.offerEpoch + 1
+        activeOfferEpoch = nextOfferEpoch
+        lastAppliedAnswerEpoch = 0
+        lastHandledRenegotiateEpoch = room.renegotiateEpoch
+
+        val offer = webRtcManager.createOffer()
+        val handoffResult = repository.handoffHostToThisDevice(
+            roomCode = roomCode,
+            hostDeviceId = myDeviceId,
+            hostName = userDisplayName,
+            offerSdp = offer.description,
+            nextOfferEpoch = nextOfferEpoch
+        )
+        handoffResult.fold(
+            onSuccess = {
+                enableAndFlushLocalIceCandidates()
+                _callPhase.value = if (room.guestUid != null) {
+                    CallPhase.Connecting
+                } else {
+                    CallPhase.WaitingForPeer
+                }
+                observeRoomSignaling()
+            },
+            onFailure = { error ->
+                _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to switch host device.")
             }
         )
     }
@@ -174,16 +290,46 @@ class CallViewModel(
         _peerPlatform.value = room.hostPlatform.ifBlank { "unknown" }
         _callPhase.value = CallPhase.Connecting
 
+        val isTakingOverGuest = isTakeover || (room.guestUid == currentUserId)
+        if (isTakingOverGuest && room.guestUid == currentUserId && room.guestDeviceId != myDeviceId) {
+            // Request Host to generate a fresh WebRTC offer for this new guest device
+            pauseAndClearIceState()
+            pendingGuestOfferMinEpoch = room.offerEpoch
+            lastAppliedOfferEpoch = room.offerEpoch
+            val reqResult = repository.requestGuestHandoff(
+                roomCode = roomCode,
+                guestDeviceId = myDeviceId,
+                guestName = userDisplayName,
+                nextRenegotiateEpoch = room.renegotiateEpoch + 1
+            )
+            reqResult.fold(
+                onSuccess = {
+                    observeRoomSignaling()
+                },
+                onFailure = { error ->
+                    _callPhase.value = CallPhase.Error(error.localizedMessage ?: "Unable to switch guest device.")
+                }
+            )
+            return
+        }
+
+        // Standard first-time guest join
+        pauseAndClearIceState()
+        val offerEpoch = room.offerEpoch
+        lastAppliedOfferEpoch = offerEpoch
         val answer = webRtcManager.createAnswer(room.offerSdp)
         ingestRemoteCandidates(room.callerCandidates)
 
         val joinResult = repository.joinCallRoom(
             roomCode = roomCode,
+            guestDeviceId = myDeviceId,
             guestName = userDisplayName,
-            answerSdp = answer.description
+            answerSdp = answer.description,
+            offerEpoch = offerEpoch
         )
         joinResult.fold(
             onSuccess = {
+                enableAndFlushLocalIceCandidates()
                 observeRoomSignaling()
             },
             onFailure = { error ->
@@ -214,38 +360,164 @@ class CallViewModel(
 
     private suspend fun handleRoomSnapshot(room: CallRoom) {
         val status = CallRoomStatus.fromWire(room.status)
-        if (isHost) {
-            if (!room.guestName.isNullOrBlank()) {
-                _peerName.value = room.guestName
-            }
-            if (!room.guestPlatform.isNullOrBlank()) {
-                _peerPlatform.value = room.guestPlatform
-            }
-            if (!room.answerSdp.isNullOrBlank() && !sentCandidatesCount.getAndSet(true)) {
-                _callPhase.value = CallPhase.Connecting
-                try {
-                    webRtcManager.setRemoteAnswer(room.answerSdp)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed setting remote answer", e)
-                }
-            }
-            ingestRemoteCandidates(room.calleeCandidates)
+
+        // 1. Detect if the same UID took over this role on another device (e.g. Web laptop)
+        val supersededOnOtherDevice = if (isHost) {
+            room.hostDeviceId.isNotBlank() && room.hostDeviceId != myDeviceId
         } else {
-            if (room.hostName.isNotBlank()) {
-                _peerName.value = room.hostName
-            }
-            if (room.hostPlatform.isNotBlank()) {
-                _peerPlatform.value = room.hostPlatform
-            }
-            ingestRemoteCandidates(room.callerCandidates)
+            room.guestUid == currentUserId &&
+                !room.guestDeviceId.isNullOrBlank() &&
+                room.guestDeviceId != myDeviceId
         }
 
+        if (supersededOnOtherDevice) {
+            handleSupersededByOtherDevice()
+            return
+        }
+
+        // 2. Check terminal room end
         if (status == CallRoomStatus.ENDED && _callPhase.value !is CallPhase.PeerEnded) {
             _callPhase.value = CallPhase.PeerEnded
             timerJob?.cancel()
             logHistoryOnce(statusOverride = CallRecordStatus.COMPLETED)
             webRtcManager.release()
+            return
         }
+
+        // 3. Process role-specific signaling & peer handoffs
+        if (isHost) {
+            handleHostSnapshot(room)
+        } else {
+            handleGuestSnapshot(room)
+        }
+    }
+
+    private suspend fun handleHostSnapshot(room: CallRoom) {
+        if (!room.guestName.isNullOrBlank()) {
+            _peerName.value = room.guestName
+        }
+        if (!room.guestPlatform.isNullOrBlank()) {
+            _peerPlatform.value = room.guestPlatform
+        }
+
+        // Guest switched devices -> Host creates a fresh offerEpoch
+        if (room.renegotiateEpoch > lastHandledRenegotiateEpoch && !isRenegotiating) {
+            isRenegotiating = true
+            try {
+                lastHandledRenegotiateEpoch = room.renegotiateEpoch
+                _callPhase.value = CallPhase.Connecting
+                pauseAndClearIceState()
+                webRtcManager.resetPeerConnectionForHandoff()
+
+                val nextOfferEpoch = room.offerEpoch + 1
+                activeOfferEpoch = nextOfferEpoch
+                lastAppliedAnswerEpoch = 0
+
+                val offer = webRtcManager.createOffer()
+                val result = repository.handoffHostToThisDevice(
+                    roomCode = roomCode,
+                    hostDeviceId = myDeviceId,
+                    hostName = userDisplayName,
+                    offerSdp = offer.description,
+                    nextOfferEpoch = nextOfferEpoch
+                )
+                result.onSuccess {
+                    enableAndFlushLocalIceCandidates()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed host renegotiation for guest handoff", e)
+            } finally {
+                isRenegotiating = false
+            }
+            return
+        }
+
+        // Apply guest answer matching our active offerEpoch
+        if (!room.answerSdp.isNullOrBlank() &&
+            room.answerEpoch == activeOfferEpoch &&
+            room.answerEpoch > lastAppliedAnswerEpoch
+        ) {
+            lastAppliedAnswerEpoch = room.answerEpoch
+            _callPhase.value = CallPhase.Connecting
+            try {
+                webRtcManager.setRemoteAnswer(room.answerSdp)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed setting remote answer", e)
+            }
+        }
+
+        if (room.answerEpoch == activeOfferEpoch) {
+            ingestRemoteCandidates(room.calleeCandidates)
+        }
+    }
+
+    private suspend fun handleGuestSnapshot(room: CallRoom) {
+        if (room.hostName.isNotBlank()) {
+            _peerName.value = room.hostName
+        }
+        if (room.hostPlatform.isNotBlank()) {
+            _peerPlatform.value = room.hostPlatform
+        }
+
+        val minEpoch = pendingGuestOfferMinEpoch
+        val waitingForRenegotiatedOffer = minEpoch != null && room.offerEpoch <= minEpoch
+
+        if (waitingForRenegotiatedOffer) {
+            return
+        }
+
+        // Host switched devices OR responded to our guest handoff with a higher offerEpoch
+        if (room.offerEpoch > lastAppliedOfferEpoch &&
+            room.answerEpoch < room.offerEpoch &&
+            !isRenegotiating
+        ) {
+            isRenegotiating = true
+            try {
+                pendingGuestOfferMinEpoch = null
+                lastAppliedOfferEpoch = room.offerEpoch
+                _callPhase.value = CallPhase.Connecting
+                pauseAndClearIceState()
+                webRtcManager.resetPeerConnectionForHandoff()
+
+                val answer = webRtcManager.createAnswer(room.offerSdp)
+                ingestRemoteCandidates(room.callerCandidates)
+
+                val result = repository.submitRenegotiatedAnswer(
+                    roomCode = roomCode,
+                    guestDeviceId = myDeviceId,
+                    guestName = userDisplayName,
+                    answerSdp = answer.description,
+                    offerEpoch = room.offerEpoch
+                )
+                result.onSuccess {
+                    enableAndFlushLocalIceCandidates()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed guest renegotiation during handoff", e)
+            } finally {
+                isRenegotiating = false
+            }
+            return
+        }
+
+        if (room.offerEpoch == lastAppliedOfferEpoch) {
+            ingestRemoteCandidates(room.callerCandidates)
+        }
+    }
+
+    private fun handleSupersededByOtherDevice() {
+        if (_callPhase.value is CallPhase.SwitchedDevice) return
+        timerJob?.cancel()
+        roomObserverJob?.cancel()
+        pauseAndClearIceState()
+        logHistoryOnce(statusOverride = CallRecordStatus.COMPLETED)
+        // Crucial: do NOT call endCallRoom() so the room stays live for the new device
+        webRtcManager.release()
+        _callPhase.value = CallPhase.SwitchedDevice
     }
 
     private fun ingestRemoteCandidates(rawList: List<Map<String, Any>>) {
@@ -274,6 +546,13 @@ class CallViewModel(
     fun toggleSpeaker() = webRtcManager.toggleSpeaker()
 
     fun endCall(onComplete: () -> Unit) {
+        if (_callPhase.value is CallPhase.SwitchedDevice) {
+            timerJob?.cancel()
+            roomObserverJob?.cancel()
+            webRtcManager.release()
+            onComplete()
+            return
+        }
         timerJob?.cancel()
         roomObserverJob?.cancel()
         val wasConnected = _elapsedSeconds.value > 0L || _callPhase.value is CallPhase.Connected

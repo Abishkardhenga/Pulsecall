@@ -100,7 +100,8 @@ import org.webrtc.VideoTrack
 @Composable
 fun CallScreen(
     viewModel: CallViewModel,
-    onExitCall: () -> Unit
+    onExitCall: () -> Unit,
+    onSwitchedDevice: () -> Unit = onExitCall
 ) {
     val context = LocalContext.current
 
@@ -152,6 +153,13 @@ fun CallScreen(
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         onDispose {
             window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    LaunchedEffect(callPhase) {
+        if (callPhase is CallPhase.SwitchedDevice) {
+            kotlinx.coroutines.delay(900L)
+            onSwitchedDevice()
         }
     }
 
@@ -273,7 +281,10 @@ fun CallScreen(
             }
 
             // 3. Bottom Call Control Dock
-            if (callPhase !is CallPhase.PeerEnded && callPhase !is CallPhase.Error) {
+            if (callPhase !is CallPhase.PeerEnded &&
+                callPhase !is CallPhase.SwitchedDevice &&
+                callPhase !is CallPhase.Error
+            ) {
                 CallControlDock(
                     isMicMuted = isMicMuted,
                     isCameraEnabled = isCameraEnabled,
@@ -304,7 +315,7 @@ private fun CallStatusBadge(
 ) {
     val dotColor = when (phase) {
         is CallPhase.Connected -> TealPulse
-        is CallPhase.PeerEnded, is CallPhase.Error -> CoralEnd
+        is CallPhase.PeerEnded, is CallPhase.SwitchedDevice, is CallPhase.Error -> CoralEnd
         else -> Color(0xFFF59E0B)
     }
     val statusText = when (phase) {
@@ -314,6 +325,7 @@ private fun CallStatusBadge(
         is CallPhase.Connecting -> "Connecting peer..."
         is CallPhase.Connected -> formatDuration(elapsedSeconds)
         is CallPhase.PeerEnded -> "Call ended"
+        is CallPhase.SwitchedDevice -> "Moved to another device"
         is CallPhase.Error -> "Connection error"
     }
 
@@ -348,6 +360,7 @@ private fun CallStatusBadge(
                 val platformTag = when (peerPlatform.lowercase()) {
                     "ios" -> " · iOS"
                     "android" -> " · Android"
+                    "web" -> " · Web"
                     else -> ""
                 }
                 Text(
@@ -599,6 +612,30 @@ private fun CallStageBackdrop(
                             .testTag("return_home_button")
                     ) {
                         Text("Return to Studio")
+                    }
+                }
+                is CallPhase.SwitchedDevice -> {
+                    CircularProgressIndicator(color = TealPulse)
+                    Text(
+                        text = "Switched to Another Device",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    Text(
+                        text = "Your call was automatically transferred and disconnected here.",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Color.White.copy(alpha = 0.75f),
+                        textAlign = TextAlign.Center
+                    )
+                    Button(
+                        onClick = onExit,
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier
+                            .height(50.dp)
+                            .testTag("switched_return_home_button")
+                    ) {
+                        Text("Back to Home")
                     }
                 }
                 is CallPhase.Error -> {
